@@ -753,8 +753,6 @@ def parsing_from_messages(
         )
         log_info(f"📉 Отфильтровано/пропущено: {parts}")
 
-def _target_key(
-
 def _target_key(target: Any) -> str:
     """Стабильный ключ для target в ledger."""
     try:
@@ -980,8 +978,6 @@ def resolve_user_for_client(client: TelegramClient, raw: Any) -> Any:
         # This succeeds only when this session knows the entity/access_hash.
         return client.get_input_entity(int(candidate.user_id))
     raise ValueError("Не удалось определить пользователя в текущей сессии")
-
-def prune_users_files(
 
 def prune_users_files(target: Union[str, int, Any], statuses: Tuple[str, ...] = ("ok","already","privacy","invalid"), include_excluded: bool = True) -> Tuple[int,int]:
     """Удаляет из usernames.txt и userids.txt тех, кто уже обработан по target (ledger) и/или в excluded_users.
