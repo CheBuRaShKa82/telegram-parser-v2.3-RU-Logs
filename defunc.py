@@ -1286,6 +1286,12 @@ def inviting_rotate_sessions(
             result.append(st)
         return result
 
+    # Re-check sessions that were unauthorized on a previous run. A repaired
+    # .session must be able to return to service without manual DB cleanup.
+    for st in states:
+        if st.banned or st.status == "unauthorized":
+            get_client(st.session_file)
+
     try:
         log_info(
             f"🚀 Старт инвайта v2.4 в {target_key}. "
