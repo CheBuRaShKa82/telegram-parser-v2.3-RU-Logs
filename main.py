@@ -343,7 +343,7 @@ def do_inviting() -> None:
             re_raw = input(
                 "Плановая смена сессии каждые N успешных инвайтов (0 = только по флуду), по умолчанию 0: "
             ).strip()
-            ma_raw = input("Максимум попыток на одну сессию N (0 = без лимита), по умолчанию 0: ").strip()
+            ma_raw = input("Максимум попыток одной сессии ЗА ЭТОТ ЗАПУСК (0 = без лимита), по умолчанию 0: ").strip()
             try:
                 rotate_every = int(re_raw) if re_raw else 0
             except Exception:
@@ -374,7 +374,7 @@ def do_inviting() -> None:
                 night_start = _parse_hm(ns, (2,0))
                 night_end = _parse_hm(ne, (7,0))
 
-            ua_raw = input("Лимит попыток на одного юзера за прогон (по умолчанию 3): ").strip()
+            ua_raw = input("Лимит попыток на одного юзера (0 = по одной на каждую доступную сессию, по умолчанию 3): ").strip()
             try:
                 max_user_attempts = int(ua_raw) if ua_raw else 3
             except Exception:
