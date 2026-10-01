@@ -1,0 +1,36 @@
+# Telegram sessions and auth state
+sessoins/
+*.session
+*.session-journal
+
+# Local configuration and secrets
+options.txt
+config.json
+.env
+.env.*
+
+# Runtime databases and logs
+invite_ledger.db
+invite_ledger.db-*
+*.db-wal
+*.db-shm
+app.log
+*.log
+
+# Parsed/exported user data
+usernames.txt
+userids.txt
+*.csv
+*.bak-*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
