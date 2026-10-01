@@ -64,6 +64,14 @@ def _configure_parser_client(client: TelegramClient) -> None:
         pass
 
 
+def _client_session_file(client: TelegramClient) -> Optional[str]:
+    session = getattr(client, "session", None)
+    filename = getattr(session, "filename", None)
+    if not filename:
+        return None
+    return os.path.basename(str(filename))
+
+
 def _resolve_source_entity(client: TelegramClient, source: Any) -> Any:
     """Normalize manual refs and dialog entities to the same Telegram entity."""
     if isinstance(source, (str, int)):
@@ -312,6 +320,7 @@ def parsing(
                         source_id=source_id,
                         source_title=source_title,
                         source_type=source_type,
+                        session_file=_client_session_file(client),
                     )
                     if parse_name and getattr(user, "username", None):
                         good_usernames.append(str(user.username))
@@ -505,6 +514,7 @@ def parsing_from_messages(
                                         msg_date.isoformat()
                                         if msg_date else None
                                     ),
+                                    session_file=_client_session_file(client),
                                 )
                                 if parse_name and getattr(user, "username", None):
                                     good_usernames.append(str(user.username))
@@ -712,6 +722,7 @@ def parsing_channel_comments(
                                                 reply_date.isoformat()
                                                 if reply_date else None
                                             ),
+                                            session_file=_client_session_file(client),
                                         )
                                         if parse_name and getattr(user, "username", None):
                                             good_usernames.append(str(user.username))
