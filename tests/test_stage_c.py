@@ -94,6 +94,22 @@ class ParserFilterTests(unittest.TestCase):
         self.assertEqual(reason, "нет username")
 
 
+class SourceMetadataTests(unittest.TestCase):
+    def test_manual_source_gets_stable_checkpoint_identity(self):
+        source_id, source_title, source_type = defunc._source_metadata(
+            "@manual_group", "messages"
+        )
+        self.assertEqual(source_id, "@manual_group")
+        self.assertEqual(source_title, "@manual_group")
+        self.assertEqual(source_type, "messages")
+        self.assertEqual(
+            defunc._parser_checkpoint_key(
+                source_id, source_title, source_type
+            ),
+            "messages:@manual_group",
+        )
+
+
 class ParserCheckpointTests(unittest.TestCase):
     def make_user(self, uid, username=None):
         return SimpleNamespace(
