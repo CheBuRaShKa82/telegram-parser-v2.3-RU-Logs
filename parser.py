@@ -6,12 +6,13 @@ from __future__ import annotations
 import csv
 import json
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from telethon import utils as tl_utils
-from telethon.errors import RPCError
+from telethon.errors import FloodWaitError, RPCError
 from telethon.sync import TelegramClient
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.types import (
@@ -22,7 +23,7 @@ from telethon.tl.types import (
     UserStatusRecently,
 )
 
-from logging_setup import log_info, log_ok, log_warn
+from logging_setup import log_info, log_ok, log_pause, log_warn
 DB_PATH = "invite_ledger.db"
 
 
@@ -50,6 +51,38 @@ class ParserFilterConfig:
 
 
 DEFAULT_PARSER_FILTERS = ParserFilterConfig()
+
+
+PARSER_FLOOD_SLEEP_THRESHOLD = 60
+
+
+def _configure_parser_client(client: TelegramClient) -> None:
+    """Use Telethon's normal short FloodWait auto-sleep for parser workloads."""
+    try:
+        client.flood_sleep_threshold = PARSER_FLOOD_SLEEP_THRESHOLD
+    except Exception:
+        pass
+
+
+def _resolve_source_entity(client: TelegramClient, source: Any) -> Any:
+    """Normalize manual refs and dialog entities to the same Telegram entity."""
+    if isinstance(source, (str, int)):
+        try:
+            return client.get_entity(source)
+        except Exception:
+            return source
+    return source
+
+
+def _resume_cursor(cp: Any, resume: bool) -> int:
+    """Resume only interrupted/running/error checkpoints, never completed ones."""
+    if not resume or cp is None or getattr(cp, "cursor_int", None) is None:
+        return 0
+    status = str(getattr(cp, "status", "") or "")
+    if status == "running" or status == "interrupted" or status.startswith("error:"):
+        return int(cp.cursor_int)
+    return 0
+
 
 
 def _is_active_within(status: Any, days: int) -> bool:
@@ -95,8 +128,10 @@ def quality_user(
         return False, "fake"
     if filters.require_username and not getattr(user, "username", None):
         return False, "нет username"
-    if filters.require_photo and not getattr(user, "photo", None):
-        return False, "нет фото"
+    if filters.require_photo:
+        photo = getattr(user, "photo", None)
+        if photo is None or type(photo).__name__ == "UserProfilePhotoEmpty":
+            return False, "нет фото"
     if filters.active_days > 0 and not _is_active_within(
         getattr(user, "status", None), filters.active_days
     ):
@@ -242,6 +277,8 @@ def parsing(
     re-scan with SQLite de-duplication; already stored users are not duplicated.
     """
     filters = filters or DEFAULT_PARSER_FILTERS
+    _configure_parser_client(client)
+    source_entity = _resolve_source_entity(client, chat_entity)
     batch = max(1, int(checkpoint_batch or 100))
     good_usernames: List[str] = []
     good_ids: List[str] = []
@@ -250,7 +287,7 @@ def parsing(
     skipped: Dict[str, int] = {}
     conn = connect_db(DB_PATH)
     source_id, source_title, source_type = _source_metadata(
-        chat_entity, "participants"
+        source_entity, "participants"
     )
     cp_key = _parser_checkpoint_key(source_id, source_title, source_type)
     error_name: Optional[str] = None
@@ -262,7 +299,7 @@ def parsing(
 
     try:
         try:
-            for user in client.iter_participants(chat_entity):
+            for user in client.iter_participants(source_entity):
                 total += 1
                 ok, reason = quality_user(user, filters)
                 if not ok:
@@ -296,6 +333,26 @@ def parsing(
                     log_info(
                         f"💾 Checkpoint участников: processed={total}, saved={kept}"
                     )
+        except FloodWaitError as exc:
+            seconds = max(0, int(getattr(exc, "seconds", 0) or 0))
+            error_name = f"FloodWait:{seconds}"
+            log_pause(
+                f"⏳ Парсинг участников остановлен на FloodWait {seconds}s; "
+                "checkpoint сохранён, новые запросы не выполняются."
+            )
+        except KeyboardInterrupt:
+            checkpoint_put(
+                conn,
+                checkpoint_key=cp_key,
+                mode=source_type,
+                source_id=source_id,
+                source_title=source_title,
+                cursor_int=None,
+                processed=total,
+                saved=kept,
+                status="interrupted",
+            )
+            raise
         except Exception as exc:
             error_name = type(exc).__name__
             log_warn(
@@ -345,8 +402,10 @@ def parsing_from_messages(
     checkpoint_batch: int = 100,
     resume: bool = True,
 ) -> None:
-    """Collect active message authors with cursor-based resume."""
+    """Collect active message authors with durable cursor-based resume."""
     filters = filters or DEFAULT_PARSER_FILTERS
+    _configure_parser_client(client)
+    source_entity = _resolve_source_entity(client, chat_entity)
     batch = max(1, int(checkpoint_batch or 100))
     good_usernames: List[str] = []
     good_ids: List[str] = []
@@ -361,119 +420,18 @@ def parsing_from_messages(
     )
     conn = connect_db(DB_PATH)
     source_id, source_title, source_type = _source_metadata(
-        chat_entity, "messages"
+        source_entity, "messages"
     )
     cp_key = _parser_checkpoint_key(source_id, source_title, source_type)
     cp = checkpoint_get(conn, cp_key) if resume else None
-    offset_id = int(cp.cursor_int) if cp and cp.cursor_int else 0
+    offset_id = _resume_cursor(cp, resume)
     last_cursor = offset_id or None
     error_name: Optional[str] = None
 
     if not resume:
         checkpoint_clear(conn, cp_key)
 
-    log_info(
-        f"🔍 Авторы сообщений: {source_title or source_id or chat_entity} | "
-        f"limit={limit_messages}, age_days={max_age_days}, "
-        f"resume_offset={offset_id or 'start'}"
-    )
-
-    try:
-        try:
-            for msg in client.iter_messages(
-                chat_entity,
-                limit=max(1, int(limit_messages)),
-                offset_id=offset_id,
-            ):
-                scanned += 1
-                if getattr(msg, "id", None):
-                    last_cursor = int(msg.id)
-
-                msg_date = getattr(msg, "date", None)
-                if cutoff is not None and msg_date is not None and msg_date < cutoff:
-                    break
-
-                sid = getattr(msg, "sender_id", None)
-                if not sid:
-                    if scanned % batch == 0:
-                        checkpoint_put(
-                            conn,
-                            checkpoint_key=cp_key,
-                            mode=source_type,
-                            source_id=source_id,
-                            source_title=source_title,
-                            cursor_int=last_cursor,
-                            processed=scanned,
-                            saved=kept,
-                            status="running",
-                        )
-                    continue
-
-                sid = int(sid)
-                if sid in seen_user_ids:
-                    continue
-                seen_user_ids.add(sid)
-                unique_found += 1
-
-                user = getattr(msg, "sender", None)
-                if user is None:
-                    try:
-                        user = msg.get_sender()
-                    except Exception:
-                        user = None
-                if user is None:
-                    try:
-                        user = client.get_entity(sid)
-                    except Exception:
-                        user = None
-                if user is None:
-                    skipped["не удалось получить пользователя"] = (
-                        skipped.get("не удалось получить пользователя", 0) + 1
-                    )
-                    continue
-
-                ok, reason = quality_user(user, filters)
-                if not ok:
-                    skipped[reason] = skipped.get(reason, 0) + 1
-                    continue
-
-                kept += 1
-                upsert_user(
-                    conn,
-                    user,
-                    source_id=source_id,
-                    source_title=source_title,
-                    source_type=source_type,
-                    seen_at=msg_date.isoformat() if msg_date else None,
-                )
-                if parse_name and getattr(user, "username", None):
-                    good_usernames.append(str(user.username))
-                if parse_id and getattr(user, "id", None) is not None:
-                    good_ids.append(str(int(user.id)))
-
-                if scanned % batch == 0:
-                    checkpoint_put(
-                        conn,
-                        checkpoint_key=cp_key,
-                        mode=source_type,
-                        source_id=source_id,
-                        source_title=source_title,
-                        cursor_int=last_cursor,
-                        processed=scanned,
-                        saved=kept,
-                        status="running",
-                    )
-                    log_info(
-                        f"💾 Checkpoint сообщений: id={last_cursor}, "
-                        f"processed={scanned}, saved={kept}"
-                    )
-        except Exception as exc:
-            error_name = type(exc).__name__
-            log_warn(
-                f"⚠️ Парсинг сообщений прерван ({error_name}); "
-                "следующий запуск может продолжить с checkpoint."
-            )
-
+    def save_checkpoint(status: str) -> None:
         checkpoint_put(
             conn,
             checkpoint_key=cp_key,
@@ -483,7 +441,106 @@ def parsing_from_messages(
             cursor_int=last_cursor,
             processed=scanned,
             saved=kept,
-            status=f"error:{error_name}" if error_name else "completed",
+            status=status,
+        )
+
+    log_info(
+        f"🔍 Авторы сообщений: {source_title or source_id or source_entity} | "
+        f"limit={limit_messages}, age_days={max_age_days}, "
+        f"resume_offset={offset_id or 'start'}"
+    )
+
+    try:
+        try:
+            for msg in client.iter_messages(
+                source_entity,
+                limit=max(1, int(limit_messages)),
+                offset_id=offset_id,
+            ):
+                scanned += 1
+                current_cursor = (
+                    int(msg.id) if getattr(msg, "id", None) is not None else None
+                )
+
+                msg_date = getattr(msg, "date", None)
+                if cutoff is not None and msg_date is not None and msg_date < cutoff:
+                    break
+
+                sid = getattr(msg, "sender_id", None)
+                if sid:
+                    sid = int(sid)
+                    if sid not in seen_user_ids:
+                        seen_user_ids.add(sid)
+                        unique_found += 1
+
+                        user = getattr(msg, "sender", None)
+                        if user is None:
+                            try:
+                                user = msg.get_sender()
+                            except Exception:
+                                user = None
+                        if user is None:
+                            try:
+                                user = client.get_entity(sid)
+                            except Exception:
+                                user = None
+
+                        if user is None:
+                            skipped["не удалось получить пользователя"] = (
+                                skipped.get("не удалось получить пользователя", 0) + 1
+                            )
+                        else:
+                            ok, reason = quality_user(user, filters)
+                            if not ok:
+                                skipped[reason] = skipped.get(reason, 0) + 1
+                            else:
+                                kept += 1
+                                upsert_user(
+                                    conn,
+                                    user,
+                                    source_id=source_id,
+                                    source_title=source_title,
+                                    source_type=source_type,
+                                    seen_at=(
+                                        msg_date.isoformat()
+                                        if msg_date else None
+                                    ),
+                                )
+                                if parse_name and getattr(user, "username", None):
+                                    good_usernames.append(str(user.username))
+                                if parse_id and getattr(user, "id", None) is not None:
+                                    good_ids.append(str(int(user.id)))
+
+                # Current message is fully handled (including deliberate skips).
+                if current_cursor is not None:
+                    last_cursor = current_cursor
+
+                if scanned % batch == 0:
+                    save_checkpoint("running")
+                    log_info(
+                        f"💾 Checkpoint сообщений: id={last_cursor}, "
+                        f"processed={scanned}, saved={kept}"
+                    )
+
+        except FloodWaitError as exc:
+            seconds = max(0, int(getattr(exc, "seconds", 0) or 0))
+            error_name = f"FloodWait:{seconds}"
+            log_pause(
+                f"⏳ Парсинг сообщений остановлен на FloodWait {seconds}s; "
+                "checkpoint сохранён, новые запросы не выполняются."
+            )
+        except KeyboardInterrupt:
+            save_checkpoint("interrupted")
+            raise
+        except Exception as exc:
+            error_name = type(exc).__name__
+            log_warn(
+                f"⚠️ Парсинг сообщений прерван ({error_name}); "
+                "следующий запуск может продолжить с checkpoint."
+            )
+
+        save_checkpoint(
+            f"error:{error_name}" if error_name else "completed"
         )
     finally:
         conn.close()
@@ -503,7 +560,6 @@ def parsing_from_messages(
         )
         log_info(f"📉 Фильтр сообщений: {parts}")
 
-
 def parsing_channel_comments(
     client: TelegramClient,
     channel_entity: Union[str, int, Any],
@@ -522,6 +578,7 @@ def parsing_channel_comments(
     This is active audience discovery, not a subscriber-list parser.
     """
     filters = filters or DEFAULT_PARSER_FILTERS
+    _configure_parser_client(client)
     batch = max(1, int(checkpoint_batch or 10))
     channel = client.get_entity(channel_entity)
 
@@ -550,7 +607,7 @@ def parsing_channel_comments(
     cp_key = _parser_checkpoint_key(source_id, source_title, source_type)
     conn = connect_db(DB_PATH)
     cp = checkpoint_get(conn, cp_key) if resume else None
-    offset_id = int(cp.cursor_int) if cp and cp.cursor_int else 0
+    offset_id = _resume_cursor(cp, resume)
     if not resume:
         checkpoint_clear(conn, cp_key)
 
@@ -568,6 +625,19 @@ def parsing_channel_comments(
     skipped: Dict[str, int] = {}
     error_name: Optional[str] = None
 
+    def save_checkpoint(status: str) -> None:
+        checkpoint_put(
+            conn,
+            checkpoint_key=cp_key,
+            mode=source_type,
+            source_id=source_id,
+            source_title=source_title,
+            cursor_int=last_post_id,
+            processed=posts_scanned,
+            saved=kept,
+            status=status,
+        )
+
     log_info(
         f"💬 Комментарии канала: {source_title or source_id} | "
         f"discussion={linked_title} | posts={limit_posts} | "
@@ -583,9 +653,9 @@ def parsing_channel_comments(
             ):
                 if not getattr(post, "id", None):
                     continue
-                posts_scanned += 1
-                last_post_id = int(post.id)
 
+                current_post_id = int(post.id)
+                posts_scanned += 1
                 post_date = getattr(post, "date", None)
                 if cutoff is not None and post_date is not None and post_date < cutoff:
                     break
@@ -597,86 +667,93 @@ def parsing_channel_comments(
                 try:
                     replies = client.iter_messages(
                         channel,
-                        reply_to=int(post.id),
+                        reply_to=current_post_id,
                         limit=reply_limit,
                     )
                     for reply in replies:
                         comments_scanned += 1
                         sid = getattr(reply, "sender_id", None)
-                        if not sid:
-                            continue
-                        sid = int(sid)
-                        if sid in seen_user_ids:
-                            continue
-                        seen_user_ids.add(sid)
+                        if sid:
+                            sid = int(sid)
+                            if sid not in seen_user_ids:
+                                seen_user_ids.add(sid)
+                                user = getattr(reply, "sender", None)
+                                if user is None:
+                                    try:
+                                        user = reply.get_sender()
+                                    except Exception:
+                                        user = None
+                                if user is None:
+                                    try:
+                                        user = client.get_entity(sid)
+                                    except Exception:
+                                        user = None
 
-                        user = getattr(reply, "sender", None)
-                        if user is None:
-                            try:
-                                user = reply.get_sender()
-                            except Exception:
-                                user = None
-                        if user is None:
-                            try:
-                                user = client.get_entity(sid)
-                            except Exception:
-                                user = None
-                        if user is None:
-                            skipped["не удалось получить пользователя"] = (
-                                skipped.get(
-                                    "не удалось получить пользователя", 0
-                                ) + 1
-                            )
-                            continue
+                                if user is None:
+                                    skipped["не удалось получить пользователя"] = (
+                                        skipped.get(
+                                            "не удалось получить пользователя", 0
+                                        ) + 1
+                                    )
+                                else:
+                                    ok, reason = quality_user(user, filters)
+                                    if not ok:
+                                        skipped[reason] = skipped.get(reason, 0) + 1
+                                    else:
+                                        kept += 1
+                                        reply_date = getattr(reply, "date", None)
+                                        upsert_user(
+                                            conn,
+                                            user,
+                                            source_id=source_id,
+                                            source_title=source_title,
+                                            source_type=source_type,
+                                            seen_at=(
+                                                reply_date.isoformat()
+                                                if reply_date else None
+                                            ),
+                                        )
+                                        if parse_name and getattr(user, "username", None):
+                                            good_usernames.append(str(user.username))
+                                        if parse_id and getattr(user, "id", None) is not None:
+                                            good_ids.append(str(int(user.id)))
 
-                        ok, reason = quality_user(user, filters)
-                        if not ok:
-                            skipped[reason] = skipped.get(reason, 0) + 1
-                            continue
+                        # Persist long comment threads even before the post ends.
+                        if comments_scanned and comments_scanned % 100 == 0:
+                            conn.commit()
 
-                        kept += 1
-                        reply_date = getattr(reply, "date", None)
-                        upsert_user(
-                            conn,
-                            user,
-                            source_id=source_id,
-                            source_title=source_title,
-                            source_type=source_type,
-                            seen_at=(
-                                reply_date.isoformat()
-                                if reply_date else None
-                            ),
-                        )
-                        if parse_name and getattr(user, "username", None):
-                            good_usernames.append(str(user.username))
-                        if parse_id and getattr(user, "id", None) is not None:
-                            good_ids.append(str(int(user.id)))
+                except FloodWaitError:
+                    # Do not let the generic RPC handler continue hammering posts.
+                    raise
                 except RPCError as exc:
                     skipped[f"comments:{type(exc).__name__}"] = (
                         skipped.get(f"comments:{type(exc).__name__}", 0) + 1
                     )
                     log_warn(
-                        f"⚠️ Пост {post.id}: комментарии недоступны "
+                        f"⚠️ Пост {current_post_id}: комментарии недоступны "
                         f"({type(exc).__name__})"
                     )
 
+                # Only advance cursor after the entire post is handled.
+                last_post_id = current_post_id
                 if posts_scanned % batch == 0:
-                    checkpoint_put(
-                        conn,
-                        checkpoint_key=cp_key,
-                        mode=source_type,
-                        source_id=source_id,
-                        source_title=source_title,
-                        cursor_int=last_post_id,
-                        processed=posts_scanned,
-                        saved=kept,
-                        status="running",
-                    )
+                    save_checkpoint("running")
                     log_info(
                         f"💾 Checkpoint комментариев: post={last_post_id}, "
                         f"posts={posts_scanned}, comments={comments_scanned}, "
                         f"saved={kept}"
                     )
+
+        except FloodWaitError as exc:
+            seconds = max(0, int(getattr(exc, "seconds", 0) or 0))
+            error_name = f"FloodWait:{seconds}"
+            log_pause(
+                f"⏳ Комментарии остановлены на FloodWait {seconds}s; "
+                "текущий пост будет повторён при resume."
+            )
+        except KeyboardInterrupt:
+            save_checkpoint("interrupted")
+            raise
         except Exception as exc:
             error_name = type(exc).__name__
             log_warn(
@@ -684,16 +761,8 @@ def parsing_channel_comments(
                 "результат и checkpoint сохранены."
             )
 
-        checkpoint_put(
-            conn,
-            checkpoint_key=cp_key,
-            mode=source_type,
-            source_id=source_id,
-            source_title=source_title,
-            cursor_int=last_post_id,
-            processed=posts_scanned,
-            saved=kept,
-            status=f"error:{error_name}" if error_name else "completed",
+        save_checkpoint(
+            f"error:{error_name}" if error_name else "completed"
         )
     finally:
         conn.close()
@@ -712,7 +781,6 @@ def parsing_channel_comments(
             for key, value in sorted(skipped.items(), key=lambda x: -x[1])
         )
         log_info(f"📉 Комментарии/фильтр: {parts}")
-
 
 def export_users(
     output_dir: str = "exports",
