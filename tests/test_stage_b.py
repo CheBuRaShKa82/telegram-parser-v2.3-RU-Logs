@@ -73,6 +73,12 @@ class SessionSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(chosen.session_file, "b.session")
 
+    def test_picker_handles_equal_fresh_sessions(self):
+        a = defunc.SessionState(session_file="a.session")
+        b = defunc.SessionState(session_file="b.session")
+        chosen = defunc._pick_best_session([b, a])
+        self.assertEqual(chosen.session_file, "a.session")
+
     def test_hour_limit_returns_next_due(self):
         now = time.time()
         st = defunc.SessionState(
@@ -100,6 +106,77 @@ class SessionSchedulerTests(unittest.TestCase):
                 self.assertEqual(loaded.status, "flood_wait")
                 self.assertEqual(loaded.status_reason, "45s")
                 conn.close()
+
+
+class RetryIntegrationTests(unittest.TestCase):
+    class FakeClient:
+        def __init__(self, fail_network=False):
+            self.fail_network = fail_network
+            self.calls = 0
+            self.disconnected = False
+
+        def __call__(self, request):
+            self.calls += 1
+            if self.fail_network:
+                raise ConnectionError("simulated")
+            return object()
+
+        def disconnect(self):
+            self.disconnected = True
+
+    def test_same_user_retries_on_second_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "retry.db")
+            clients = {
+                "a.session": self.FakeClient(fail_network=True),
+                "b.session": self.FakeClient(fail_network=False),
+            }
+
+            def make_client(session_file, api_id, api_hash):
+                return clients[session_file]
+
+            with (
+                patch.object(defunc, "LEDGER_DB", db),
+                patch.object(defunc, "_make_client", side_effect=make_client),
+                patch.object(
+                    defunc, "resolve_target_for_client", return_value=object()
+                ),
+                patch.object(
+                    defunc, "resolve_user_for_client", return_value=object()
+                ),
+                patch.object(defunc.time, "sleep", return_value=None),
+            ):
+                defunc.inviting_rotate_sessions(
+                    api_id=1,
+                    api_hash="hash",
+                    session_files=["a.session", "b.session"],
+                    target="@target",
+                    users=[defunc.UserCandidate(42, "tester")],
+                    base_delay=1.0,
+                    jitter_min=0.0,
+                    jitter_max=0.0,
+                    max_user_attempts=2,
+                    max_attempts_per_session=1,
+                )
+
+            conn = connect_db(db)
+            self.assertEqual(
+                invite_state_get(conn, "@target", "id:42"),
+                ("ok", "invited"),
+            )
+            self.assertEqual(
+                invite_event_count(conn, "@target", "id:42"), 2
+            )
+            event_sessions = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT session_file FROM invite_events "
+                    "WHERE target=? AND user_key=? ORDER BY id",
+                    ("@target", "id:42"),
+                ).fetchall()
+            ]
+            self.assertEqual(event_sessions, ["a.session", "b.session"])
+            conn.close()
 
 
 if __name__ == "__main__":
