@@ -4,7 +4,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-import defunc
+import inviter
 from storage import (
     connect_db,
     invite_event_count,
@@ -55,52 +55,52 @@ class InviteStorageTests(unittest.TestCase):
 class SessionSchedulerTests(unittest.TestCase):
     def test_picker_prefers_ready_session(self):
         now = time.time()
-        a = defunc.SessionState(
+        a = inviter.SessionState(
             session_file="a.session",
             blocked_until=now + 120,
             status="flood_wait",
         )
-        b = defunc.SessionState(session_file="b.session")
-        chosen = defunc._pick_best_session([a, b])
+        b = inviter.SessionState(session_file="b.session")
+        chosen = inviter._pick_best_session([a, b])
         self.assertIsNotNone(chosen)
         self.assertEqual(chosen.session_file, "b.session")
 
     def test_picker_respects_run_exclusions(self):
-        a = defunc.SessionState(session_file="a.session")
-        b = defunc.SessionState(session_file="b.session")
-        chosen = defunc._pick_best_session(
+        a = inviter.SessionState(session_file="a.session")
+        b = inviter.SessionState(session_file="b.session")
+        chosen = inviter._pick_best_session(
             [a, b], excluded={"a.session"}
         )
         self.assertEqual(chosen.session_file, "b.session")
 
     def test_picker_handles_equal_fresh_sessions(self):
-        a = defunc.SessionState(session_file="a.session")
-        b = defunc.SessionState(session_file="b.session")
-        chosen = defunc._pick_best_session([b, a])
+        a = inviter.SessionState(session_file="a.session")
+        b = inviter.SessionState(session_file="b.session")
+        chosen = inviter._pick_best_session([b, a])
         self.assertEqual(chosen.session_file, "a.session")
 
     def test_hour_limit_returns_next_due(self):
         now = time.time()
-        st = defunc.SessionState(
+        st = inviter.SessionState(
             session_file="a.session",
             hour_window_start=now - 10,
             hour_count=5,
         )
-        due = defunc.session_next_time_due_to_limits(st, 5, 0)
+        due = inviter.session_next_time_due_to_limits(st, 5, 0)
         self.assertGreater(due, now)
 
     def test_session_status_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = os.path.join(tmp, "state.db")
             with patch.object(defunc, "LEDGER_DB", db):
-                conn = defunc._db()
-                states = defunc.session_stats_load(conn, ["a.session"])
+                conn = inviter._db()
+                states = inviter.session_stats_load(conn, ["a.session"])
                 st = states["a.session"]
                 st.status = "flood_wait"
                 st.status_reason = "45s"
                 st.blocked_until = time.time() + 45
-                defunc.session_stats_save(conn, st)
-                loaded = defunc.session_stats_load(
+                inviter.session_stats_save(conn, st)
+                loaded = inviter.session_stats_load(
                     conn, ["a.session"]
                 )["a.session"]
                 self.assertEqual(loaded.status, "flood_wait")
@@ -144,14 +144,14 @@ class RetryIntegrationTests(unittest.TestCase):
                 patch.object(
                     defunc, "resolve_user_for_client", return_value=object()
                 ),
-                patch.object(defunc.time, "sleep", return_value=None),
+                patch.object(inviter.time, "sleep", return_value=None),
             ):
-                defunc.inviting_rotate_sessions(
+                inviter.inviting_rotate_sessions(
                     api_id=1,
                     api_hash="hash",
                     session_files=["a.session", "b.session"],
                     target="@target",
-                    users=[defunc.UserCandidate(42, "tester")],
+                    users=[__import__('storage').UserCandidate(42, "tester")],
                     base_delay=1.0,
                     jitter_min=0.0,
                     jitter_max=0.0,
