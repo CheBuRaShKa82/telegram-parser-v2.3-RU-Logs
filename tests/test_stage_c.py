@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import parser as parser_mod
-from storage import checkpoint_get, connect_db, export_users_rows
+from storage import checkpoint_get, checkpoint_put, connect_db, export_users_rows
 
 
 class FakeMessageClient:
@@ -94,6 +94,24 @@ class ParserFilterTests(unittest.TestCase):
         self.assertEqual(reason, "нет username")
 
 
+    def test_empty_photo_object_is_rejected_when_required(self):
+        EmptyPhoto = type("UserProfilePhotoEmpty", (), {})
+        user = SimpleNamespace(
+            id=2,
+            username="has_name",
+            photo=EmptyPhoto(),
+            bot=False,
+            deleted=False,
+            scam=False,
+            fake=False,
+            status=None,
+        )
+        cfg = parser_mod.ParserFilterConfig(require_photo=True)
+        ok, reason = parser_mod.quality_user(user, cfg)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "нет фото")
+
+
 class SourceMetadataTests(unittest.TestCase):
     def test_manual_source_gets_stable_checkpoint_identity(self):
         source_id, source_title, source_type = parser_mod._source_metadata(
@@ -125,7 +143,7 @@ class ParserCheckpointTests(unittest.TestCase):
             status=None,
         )
 
-    def test_message_parser_resumes_from_last_cursor(self):
+    def test_completed_message_checkpoint_starts_fresh(self):
         user1 = self.make_user(101, "one")
         user2 = self.make_user(102, "two")
         messages = [
@@ -158,13 +176,96 @@ class ParserCheckpointTests(unittest.TestCase):
                     resume=True,
                 )
 
-            self.assertEqual(client.offsets, [0, 30])
+            self.assertEqual(client.offsets, [0, 0])
             conn = connect_db(db)
             rows = export_users_rows(conn)
             self.assertEqual({row["user_id"] for row in rows}, {101, 102})
             cp = checkpoint_get(conn, "messages:777")
             self.assertIsNotNone(cp)
-            self.assertEqual(cp.cursor_int, 20)
+            self.assertEqual(cp.status, "completed")
+            conn.close()
+
+
+    def test_error_checkpoint_resumes_from_cursor(self):
+        user2 = self.make_user(102, "two")
+        client = FakeMessageClient(
+            [SimpleNamespace(id=20, sender_id=102, sender=user2, date=None)]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "resume.db")
+            conn = connect_db(db)
+            checkpoint_put(
+                conn,
+                checkpoint_key="messages:777",
+                mode="messages",
+                source_id="777",
+                source_title="Chat",
+                cursor_int=30,
+                processed=1,
+                saved=1,
+                status="error:ConnectionError",
+            )
+            conn.close()
+
+            with patch.object(parser_mod, "DB_PATH", db):
+                parser_mod.parsing_from_messages(
+                    client,
+                    SimpleNamespace(id=777, title="Chat"),
+                    parse_id=False,
+                    parse_name=False,
+                    limit_messages=10,
+                    max_age_days=0,
+                    checkpoint_batch=1,
+                    resume=True,
+                )
+
+            self.assertEqual(client.offsets, [30])
+            conn = connect_db(db)
+            rows = export_users_rows(conn)
+            self.assertEqual({row["user_id"] for row in rows}, {102})
+            conn.close()
+
+    def test_keyboard_interrupt_commits_current_progress(self):
+        user = self.make_user(103, "interrupt")
+
+        class InterruptingClient(FakeMessageClient):
+            def iter_messages(self, entity, limit=None, offset_id=0, **kwargs):
+                self.offsets.append(offset_id)
+
+                def generator():
+                    yield SimpleNamespace(
+                        id=30,
+                        sender_id=103,
+                        sender=user,
+                        date=None,
+                    )
+                    raise KeyboardInterrupt()
+
+                return generator()
+
+        client = InterruptingClient([])
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "interrupt.db")
+            with patch.object(parser_mod, "DB_PATH", db):
+                with self.assertRaises(KeyboardInterrupt):
+                    parser_mod.parsing_from_messages(
+                        client,
+                        SimpleNamespace(id=777, title="Chat"),
+                        parse_id=False,
+                        parse_name=False,
+                        limit_messages=10,
+                        max_age_days=0,
+                        checkpoint_batch=100,
+                        resume=True,
+                    )
+
+            conn = connect_db(db)
+            rows = export_users_rows(conn)
+            self.assertEqual({row["user_id"] for row in rows}, {103})
+            cp = checkpoint_get(conn, "messages:777")
+            self.assertEqual(cp.status, "interrupted")
+            self.assertEqual(cp.cursor_int, 30)
             conn.close()
 
 
