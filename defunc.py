@@ -684,55 +684,138 @@ def _source_metadata(chat_entity: Any, source_type: str) -> Tuple[Optional[str],
     )
 
 
-def parsing(client: TelegramClient, chat_entity: Union[str, int, Any], parse_id: bool, parse_name: bool) -> None:
-    """Парсинг видимого списка участников с сохранением в SQLite."""
-    log_info(f"🔍 Начат парсинг: {chat_entity}")
+def _parser_checkpoint_key(
+    source_id: Optional[str],
+    source_title: Optional[str],
+    mode: str,
+) -> str:
+    identity = source_id or source_title or "unknown"
+    return f"{mode}:{identity}"
+
+
+def _finalize_legacy_exports(
+    usernames: Iterable[str],
+    user_ids: Iterable[str],
+    *,
+    parse_name: bool,
+    parse_id: bool,
+) -> Tuple[int, int]:
+    added_u = (
+        _append_unique("usernames.txt", usernames, prefix_at=True)
+        if parse_name else 0
+    )
+    added_i = (
+        _append_unique("userids.txt", user_ids, prefix_at=False)
+        if parse_id else 0
+    )
+    return added_u, added_i
+
+
+def parsing(
+    client: TelegramClient,
+    chat_entity: Union[str, int, Any],
+    parse_id: bool,
+    parse_name: bool,
+    *,
+    filters: Optional[ParserFilterConfig] = None,
+    checkpoint_batch: int = 100,
+) -> None:
+    """Parse visible participants with durable SQLite checkpoints.
+
+    Telegram does not expose a reliable generic offset for all participant
+    listings through this high-level iterator. Resume therefore means safe
+    re-scan with SQLite de-duplication; already stored users are not duplicated.
+    """
+    filters = filters or DEFAULT_PARSER_FILTERS
+    batch = max(1, int(checkpoint_batch or 100))
     good_usernames: List[str] = []
     good_ids: List[str] = []
     total = 0
     kept = 0
     skipped: Dict[str, int] = {}
     conn = _db()
-    source_id, source_title, source_type = _source_metadata(chat_entity, "participants")
+    source_id, source_title, source_type = _source_metadata(
+        chat_entity, "participants"
+    )
+    cp_key = _parser_checkpoint_key(source_id, source_title, source_type)
+    error_name: Optional[str] = None
+
+    log_info(
+        f"🔍 Парсинг участников: {source_title or source_id or chat_entity} | "
+        f"checkpoint={cp_key}"
+    )
 
     try:
-        for user in client.iter_participants(chat_entity):
-            total += 1
-            ok, reason = quality_hard(user)
-            if not ok:
-                skipped[reason] = skipped.get(reason, 0) + 1
-                continue
+        try:
+            for user in client.iter_participants(chat_entity):
+                total += 1
+                ok, reason = quality_user(user, filters)
+                if not ok:
+                    skipped[reason] = skipped.get(reason, 0) + 1
+                else:
+                    kept += 1
+                    upsert_user(
+                        conn,
+                        user,
+                        source_id=source_id,
+                        source_title=source_title,
+                        source_type=source_type,
+                    )
+                    if parse_name and getattr(user, "username", None):
+                        good_usernames.append(str(user.username))
+                    if parse_id and getattr(user, "id", None) is not None:
+                        good_ids.append(str(int(user.id)))
 
-            kept += 1
-            upsert_user(
-                conn,
-                user,
-                source_id=source_id,
-                source_title=source_title,
-                source_type=source_type,
+                if total % batch == 0:
+                    checkpoint_put(
+                        conn,
+                        checkpoint_key=cp_key,
+                        mode=source_type,
+                        source_id=source_id,
+                        source_title=source_title,
+                        cursor_int=None,
+                        processed=total,
+                        saved=kept,
+                        status="running",
+                    )
+                    log_info(
+                        f"💾 Checkpoint участников: processed={total}, saved={kept}"
+                    )
+        except Exception as exc:
+            error_name = type(exc).__name__
+            log_warn(
+                f"⚠️ Парсинг участников прерван ({error_name}); "
+                "уже сохранённые пользователи остаются в SQLite."
             )
-            if parse_name and getattr(user, "username", None):
-                good_usernames.append(user.username)
-            if parse_id and getattr(user, "id", None) is not None:
-                good_ids.append(str(int(user.id)))
 
-            if kept % 200 == 0:
-                conn.commit()
-        conn.commit()
+        checkpoint_put(
+            conn,
+            checkpoint_key=cp_key,
+            mode=source_type,
+            source_id=source_id,
+            source_title=source_title,
+            cursor_int=None,
+            processed=total,
+            saved=kept,
+            status=f"error:{error_name}" if error_name else "completed",
+        )
     finally:
         conn.close()
 
-    added_u = _append_unique("usernames.txt", good_usernames, prefix_at=True) if parse_name else 0
-    added_i = _append_unique("userids.txt", good_ids, prefix_at=False) if parse_id else 0
+    added_u, added_i = _finalize_legacy_exports(
+        good_usernames, good_ids,
+        parse_name=parse_name, parse_id=parse_id,
+    )
     log_ok(
-        f"✅ Парсинг завершён. Всего: {total}, прошло фильтр: {kept}, "
-        f"добавлено usernames: {added_u}, ids: {added_i}"
+        f"✅ Участники: просмотрено={total}, сохранено={kept}, "
+        f"TXT usernames+={added_u}, ids+={added_i}"
     )
     if skipped:
         parts = ", ".join(
-            f"{k}={v}" for k, v in sorted(skipped.items(), key=lambda x: -x[1])
+            f"{key}={value}"
+            for key, value in sorted(skipped.items(), key=lambda x: -x[1])
         )
-        log_info(f"📉 Отфильтровано: {parts}")
+        log_info(f"📉 Фильтр: {parts}")
 
 
 def parsing_from_messages(
@@ -742,39 +825,77 @@ def parsing_from_messages(
     parse_name: bool,
     limit_messages: int = 5000,
     max_age_days: int = 7,
+    *,
+    filters: Optional[ParserFilterConfig] = None,
+    checkpoint_batch: int = 100,
+    resume: bool = True,
 ) -> None:
-    """Собирает активных авторов сообщений и сохраняет их в SQLite."""
-    log_info(
-        f"🔍 Начат парсинг из сообщений: {chat_entity} | "
-        f"лимит сообщений={limit_messages} | возраст≤{max_age_days}д"
-    )
-    print("Старт: парсинг из сообщений… Это может занять время. Прогресс будет обновляться.", flush=True)
+    """Collect active message authors with cursor-based resume."""
+    filters = filters or DEFAULT_PARSER_FILTERS
+    batch = max(1, int(checkpoint_batch or 100))
     good_usernames: List[str] = []
     good_ids: List[str] = []
     scanned = 0
     unique_found = 0
     kept = 0
     skipped: Dict[str, int] = {}
-    seen_user_ids: set = set()
-    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    seen_user_ids: set[int] = set()
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        if max_age_days > 0 else None
+    )
     conn = _db()
-    source_id, source_title, source_type = _source_metadata(chat_entity, "messages")
+    source_id, source_title, source_type = _source_metadata(
+        chat_entity, "messages"
+    )
+    cp_key = _parser_checkpoint_key(source_id, source_title, source_type)
+    cp = checkpoint_get(conn, cp_key) if resume else None
+    offset_id = int(cp.cursor_int) if cp and cp.cursor_int else 0
+    last_cursor = offset_id or None
+    error_name: Optional[str] = None
+
+    if not resume:
+        checkpoint_clear(conn, cp_key)
+
+    log_info(
+        f"🔍 Авторы сообщений: {source_title or source_id or chat_entity} | "
+        f"limit={limit_messages}, age_days={max_age_days}, "
+        f"resume_offset={offset_id or 'start'}"
+    )
 
     try:
-        for msg in client.iter_messages(chat_entity, limit=limit_messages):
-            scanned += 1
-            if scanned % 200 == 0:
-                print(
-                    f"Просмотрено: {scanned} | уникальных авторов: {unique_found} | прошло фильтр: {kept}",
-                    end="\r",
-                    flush=True,
-                )
-            try:
-                if getattr(msg, "date", None) is not None and msg.date < cutoff:
+        try:
+            for msg in client.iter_messages(
+                chat_entity,
+                limit=max(1, int(limit_messages)),
+                offset_id=offset_id,
+            ):
+                scanned += 1
+                if getattr(msg, "id", None):
+                    last_cursor = int(msg.id)
+
+                msg_date = getattr(msg, "date", None)
+                if cutoff is not None and msg_date is not None and msg_date < cutoff:
                     break
 
                 sid = getattr(msg, "sender_id", None)
-                if not sid or sid in seen_user_ids:
+                if not sid:
+                    if scanned % batch == 0:
+                        checkpoint_put(
+                            conn,
+                            checkpoint_key=cp_key,
+                            mode=source_type,
+                            source_id=source_id,
+                            source_title=source_title,
+                            cursor_int=last_cursor,
+                            processed=scanned,
+                            saved=kept,
+                            status="running",
+                        )
+                    continue
+
+                sid = int(sid)
+                if sid in seen_user_ids:
                     continue
                 seen_user_ids.add(sid)
                 unique_found += 1
@@ -791,12 +912,12 @@ def parsing_from_messages(
                     except Exception:
                         user = None
                 if user is None:
-                    skipped["не удалось получить пользователя"] = skipped.get(
-                        "не удалось получить пользователя", 0
-                    ) + 1
+                    skipped["не удалось получить пользователя"] = (
+                        skipped.get("не удалось получить пользователя", 0) + 1
+                    )
                     continue
 
-                ok, reason = quality_hard(user)
+                ok, reason = quality_user(user, filters)
                 if not ok:
                     skipped[reason] = skipped.get(reason, 0) + 1
                     continue
@@ -808,41 +929,339 @@ def parsing_from_messages(
                     source_id=source_id,
                     source_title=source_title,
                     source_type=source_type,
-                    seen_at=getattr(msg, "date", None).isoformat()
-                    if getattr(msg, "date", None)
-                    else None,
+                    seen_at=msg_date.isoformat() if msg_date else None,
                 )
                 if parse_name and getattr(user, "username", None):
-                    good_usernames.append(user.username)
+                    good_usernames.append(str(user.username))
                 if parse_id and getattr(user, "id", None) is not None:
                     good_ids.append(str(int(user.id)))
 
-                if kept % 200 == 0:
-                    conn.commit()
-            except Exception as exc:
-                skipped["ошибка сообщения"] = skipped.get("ошибка сообщения", 0) + 1
-                log_warn(f"⚠️ Ошибка при обработке сообщения: {type(exc).__name__}")
-        conn.commit()
+                if scanned % batch == 0:
+                    checkpoint_put(
+                        conn,
+                        checkpoint_key=cp_key,
+                        mode=source_type,
+                        source_id=source_id,
+                        source_title=source_title,
+                        cursor_int=last_cursor,
+                        processed=scanned,
+                        saved=kept,
+                        status="running",
+                    )
+                    log_info(
+                        f"💾 Checkpoint сообщений: id={last_cursor}, "
+                        f"processed={scanned}, saved={kept}"
+                    )
+        except Exception as exc:
+            error_name = type(exc).__name__
+            log_warn(
+                f"⚠️ Парсинг сообщений прерван ({error_name}); "
+                "следующий запуск может продолжить с checkpoint."
+            )
+
+        checkpoint_put(
+            conn,
+            checkpoint_key=cp_key,
+            mode=source_type,
+            source_id=source_id,
+            source_title=source_title,
+            cursor_int=last_cursor,
+            processed=scanned,
+            saved=kept,
+            status=f"error:{error_name}" if error_name else "completed",
+        )
     finally:
         conn.close()
 
-    added_u = _append_unique("usernames.txt", good_usernames, prefix_at=True) if parse_name else 0
-    added_i = _append_unique("userids.txt", good_ids, prefix_at=False) if parse_id else 0
-    log_ok(
-        f"✅ Парсинг из сообщений завершён. Сообщений просмотрено: {scanned}, "
-        f"уникальных авторов: {unique_found}, прошло фильтр: {kept}, "
-        f"добавлено usernames: {added_u}, ids: {added_i}"
+    added_u, added_i = _finalize_legacy_exports(
+        good_usernames, good_ids,
+        parse_name=parse_name, parse_id=parse_id,
     )
-    print()
-    print(
-        "Готово: парсинг из сообщений завершён. Итоги — в app.log, SQLite и экспортных TXT",
-        flush=True,
+    log_ok(
+        f"✅ Сообщения: просмотрено={scanned}, уникальных={unique_found}, "
+        f"сохранено={kept}, TXT usernames+={added_u}, ids+={added_i}"
     )
     if skipped:
         parts = ", ".join(
-            f"{k}={v}" for k, v in sorted(skipped.items(), key=lambda x: -x[1])
+            f"{key}={value}"
+            for key, value in sorted(skipped.items(), key=lambda x: -x[1])
         )
-        log_info(f"📉 Отфильтровано/пропущено: {parts}")
+        log_info(f"📉 Фильтр сообщений: {parts}")
+
+
+def parsing_channel_comments(
+    client: TelegramClient,
+    channel_entity: Union[str, int, Any],
+    parse_id: bool,
+    parse_name: bool,
+    *,
+    limit_posts: int = 200,
+    comments_per_post: int = 0,
+    max_age_days: int = 30,
+    filters: Optional[ParserFilterConfig] = None,
+    checkpoint_batch: int = 10,
+    resume: bool = True,
+) -> None:
+    """Collect authors of comments under broadcast-channel posts.
+
+    This is active audience discovery, not a subscriber-list parser.
+    """
+    filters = filters or DEFAULT_PARSER_FILTERS
+    batch = max(1, int(checkpoint_batch or 10))
+    channel = client.get_entity(channel_entity)
+
+    if not getattr(channel, "broadcast", False):
+        raise ValueError(
+            "Режим комментариев предназначен для broadcast-канала."
+        )
+
+    full = client(GetFullChannelRequest(channel))
+    linked_chat_id = getattr(full.full_chat, "linked_chat_id", None)
+    if not linked_chat_id:
+        raise ValueError("У канала нет связанной discussion-группы/комментариев.")
+
+    linked_group = next(
+        (
+            chat for chat in getattr(full, "chats", [])
+            if getattr(chat, "id", None) == linked_chat_id
+        ),
+        None,
+    )
+    linked_title = getattr(linked_group, "title", None) or str(linked_chat_id)
+
+    source_id, source_title, source_type = _source_metadata(
+        channel, "channel_comments"
+    )
+    cp_key = _parser_checkpoint_key(source_id, source_title, source_type)
+    conn = _db()
+    cp = checkpoint_get(conn, cp_key) if resume else None
+    offset_id = int(cp.cursor_int) if cp and cp.cursor_int else 0
+    if not resume:
+        checkpoint_clear(conn, cp_key)
+
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        if max_age_days > 0 else None
+    )
+    posts_scanned = 0
+    comments_scanned = 0
+    kept = 0
+    last_post_id = offset_id or None
+    seen_user_ids: set[int] = set()
+    good_usernames: List[str] = []
+    good_ids: List[str] = []
+    skipped: Dict[str, int] = {}
+    error_name: Optional[str] = None
+
+    log_info(
+        f"💬 Комментарии канала: {source_title or source_id} | "
+        f"discussion={linked_title} | posts={limit_posts} | "
+        f"resume_offset={offset_id or 'start'}"
+    )
+
+    try:
+        try:
+            for post in client.iter_messages(
+                channel,
+                limit=max(1, int(limit_posts)),
+                offset_id=offset_id,
+            ):
+                if not getattr(post, "id", None):
+                    continue
+                posts_scanned += 1
+                last_post_id = int(post.id)
+
+                post_date = getattr(post, "date", None)
+                if cutoff is not None and post_date is not None and post_date < cutoff:
+                    break
+
+                reply_limit = (
+                    None if int(comments_per_post or 0) <= 0
+                    else int(comments_per_post)
+                )
+                try:
+                    replies = client.iter_messages(
+                        channel,
+                        reply_to=int(post.id),
+                        limit=reply_limit,
+                    )
+                    for reply in replies:
+                        comments_scanned += 1
+                        sid = getattr(reply, "sender_id", None)
+                        if not sid:
+                            continue
+                        sid = int(sid)
+                        if sid in seen_user_ids:
+                            continue
+                        seen_user_ids.add(sid)
+
+                        user = getattr(reply, "sender", None)
+                        if user is None:
+                            try:
+                                user = reply.get_sender()
+                            except Exception:
+                                user = None
+                        if user is None:
+                            try:
+                                user = client.get_entity(sid)
+                            except Exception:
+                                user = None
+                        if user is None:
+                            skipped["не удалось получить пользователя"] = (
+                                skipped.get(
+                                    "не удалось получить пользователя", 0
+                                ) + 1
+                            )
+                            continue
+
+                        ok, reason = quality_user(user, filters)
+                        if not ok:
+                            skipped[reason] = skipped.get(reason, 0) + 1
+                            continue
+
+                        kept += 1
+                        reply_date = getattr(reply, "date", None)
+                        upsert_user(
+                            conn,
+                            user,
+                            source_id=source_id,
+                            source_title=source_title,
+                            source_type=source_type,
+                            seen_at=(
+                                reply_date.isoformat()
+                                if reply_date else None
+                            ),
+                        )
+                        if parse_name and getattr(user, "username", None):
+                            good_usernames.append(str(user.username))
+                        if parse_id and getattr(user, "id", None) is not None:
+                            good_ids.append(str(int(user.id)))
+                except RPCError as exc:
+                    skipped[f"comments:{type(exc).__name__}"] = (
+                        skipped.get(f"comments:{type(exc).__name__}", 0) + 1
+                    )
+                    log_warn(
+                        f"⚠️ Пост {post.id}: комментарии недоступны "
+                        f"({type(exc).__name__})"
+                    )
+
+                if posts_scanned % batch == 0:
+                    checkpoint_put(
+                        conn,
+                        checkpoint_key=cp_key,
+                        mode=source_type,
+                        source_id=source_id,
+                        source_title=source_title,
+                        cursor_int=last_post_id,
+                        processed=posts_scanned,
+                        saved=kept,
+                        status="running",
+                    )
+                    log_info(
+                        f"💾 Checkpoint комментариев: post={last_post_id}, "
+                        f"posts={posts_scanned}, comments={comments_scanned}, "
+                        f"saved={kept}"
+                    )
+        except Exception as exc:
+            error_name = type(exc).__name__
+            log_warn(
+                f"⚠️ Парсинг комментариев прерван ({error_name}); "
+                "результат и checkpoint сохранены."
+            )
+
+        checkpoint_put(
+            conn,
+            checkpoint_key=cp_key,
+            mode=source_type,
+            source_id=source_id,
+            source_title=source_title,
+            cursor_int=last_post_id,
+            processed=posts_scanned,
+            saved=kept,
+            status=f"error:{error_name}" if error_name else "completed",
+        )
+    finally:
+        conn.close()
+
+    added_u, added_i = _finalize_legacy_exports(
+        good_usernames, good_ids,
+        parse_name=parse_name, parse_id=parse_id,
+    )
+    log_ok(
+        f"✅ Комментарии: posts={posts_scanned}, comments={comments_scanned}, "
+        f"уникальных сохранено={kept}, TXT usernames+={added_u}, ids+={added_i}"
+    )
+    if skipped:
+        parts = ", ".join(
+            f"{key}={value}"
+            for key, value in sorted(skipped.items(), key=lambda x: -x[1])
+        )
+        log_info(f"📉 Комментарии/фильтр: {parts}")
+
+
+def export_users(
+    output_dir: str = "exports",
+    formats: Tuple[str, ...] = ("csv", "json", "txt"),
+) -> Dict[str, str]:
+    """Export the canonical SQLite user database."""
+    conn = _db()
+    try:
+        rows = export_users_rows(conn)
+    finally:
+        conn.close()
+
+    os.makedirs(output_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    result: Dict[str, str] = {}
+    normalized = {fmt.lower().strip() for fmt in formats}
+
+    if "csv" in normalized:
+        path = os.path.join(output_dir, f"users_{stamp}.csv")
+        fields = [
+            "user_id", "username", "first_name", "last_name",
+            "source_id", "source_title", "source_type",
+            "parsed_at", "last_seen_at",
+        ]
+        with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+        result["csv"] = path
+
+    if "json" in normalized:
+        path = os.path.join(output_dir, f"users_{stamp}.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(rows, handle, ensure_ascii=False, indent=2)
+        result["json"] = path
+
+    if "txt" in normalized:
+        path = os.path.join(output_dir, f"users_{stamp}.txt")
+        with open(path, "w", encoding="utf-8") as handle:
+            for row in rows:
+                username = row.get("username") or ""
+                if username:
+                    username = "@" + str(username).lstrip("@")
+                handle.write(
+                    "\t".join(
+                        [
+                            str(row.get("user_id") or ""),
+                            username,
+                            str(row.get("first_name") or ""),
+                            str(row.get("last_name") or ""),
+                            str(row.get("source_title") or ""),
+                            str(row.get("source_type") or ""),
+                        ]
+                    )
+                    + "\n"
+                )
+        result["txt"] = path
+
+    log_ok(
+        f"📦 Экспорт пользователей: rows={len(rows)} | "
+        + ", ".join(f"{key}={value}" for key, value in result.items())
+    )
+    return result
+
 
 def _target_key(target: Any) -> str:
     """Стабильный ключ для target в ledger."""
