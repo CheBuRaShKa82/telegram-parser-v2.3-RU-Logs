@@ -105,7 +105,7 @@ def quality_user(
 
 
 def quality_hard(user: Any) -> Tuple[bool, str]:
-    """Legacy v2.3 hard filter kept for compatibility."""
+    """Legacy strict filter kept for compatibility."""
     return quality_user(
         user,
         ParserFilterConfig(
