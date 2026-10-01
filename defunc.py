@@ -1155,425 +1155,651 @@ def inviting_rotate_sessions(
     switch_on_floodwait_seconds: int = 60,
     rotate_every: int = 0,
     max_attempts_per_session: int = 0,
-    # Soft limits (0 = off)
     per_hour_limit: int = 0,
     per_day_limit: int = 0,
-    # Pro additions (safe defaults)
     jitter_min: float = 0.3,
     jitter_max: float = 1.2,
     max_user_attempts: int = 3,
     peerflood_freeze_hours: int = 24,
     floodwait_buffer_seconds: int = 60,
-    # Night mode
     night_mode: bool = False,
     night_start: Tuple[int, int] = (2, 0),
     night_end: Tuple[int, int] = (7, 0),
     night_sleep_jitter: Tuple[float, float] = (30.0, 120.0),
 ) -> None:
-    """Invite with smart session orchestration.
+    """Invite with per-user retry and per-session isolation.
 
-    This is a "pro mode" upgrade inspired by ProMax20 inviter:
-    - per-session gating (blocked/frozen/banned)
-    - fair picking: earliest ready session
-    - jittered delays and backoff
-    - optional night mode pause window
-    - per-user attempt cap (prevents infinite loops)
-
-    Existing behavior kept:
-    - ledger skip for ok/already/privacy/invalid
-    - switch on big FloodWait; immediate switch on PeerFlood
+    Telegram server-side waits are always respected per session. Rotation only
+    moves work to another independently available session; it never clears or
+    shortens FloodWait/PeerFlood timers.
     """
-
     if not session_files:
         raise ValueError("Не переданы session_files")
 
     conn = _db()
     target_key = _target_key(target)
-
     delay = max(1.0, float(base_delay))
+    user_limit = max(1, int(max_user_attempts or len(session_files) or 1))
 
-    # session states (persisted)
     st_map = session_stats_load(conn, session_files)
     states = [st_map[sf] for sf in session_files]
-
     state_by_sf = {st.session_file: st for st in states}
 
-    # counters
     ok_cnt = 0
     skip_cnt = 0
     fail_cnt = 0
+    exhausted_cnt = 0
 
-    # per-session diagnostics counters
-    ses_stats: Dict[str, Dict[str, int]] = {sf: {
-        "ok": 0,
-        "privacy": 0,
-        "forbidden": 0,
-        "not_mutual": 0,
-        "user_kicked": 0,
-        "user_blocked": 0,
-        "user_channels_too_much": 0,
-        "floodwait": 0,
-        "peerflood": 0,
-        "invalid": 0,
-        "network": 0,
-        "rpc_other": 0,
-        "other": 0,
-    } for sf in session_files}
+    stat_keys = (
+        "ok", "already", "privacy", "forbidden", "not_mutual",
+        "user_kicked", "user_blocked", "user_channels_too_much",
+        "floodwait", "peerflood", "invalid", "network", "resolve",
+        "rpc_other", "other",
+    )
+    ses_stats: Dict[str, Dict[str, int]] = {
+        sf: {key: 0 for key in stat_keys} for sf in session_files
+    }
 
-    # per-session counters for planned rotation/attempt limits
     ok_in_session = {sf: 0 for sf in session_files}
     attempts_in_session = {sf: 0 for sf in session_files}
-
-    # per-user attempts in this run
-    user_attempts: Dict[str, int] = {}
-
-    # cache of connected clients (keep it small to reduce reconnect storms)
+    retired_for_run: set[str] = set()
     client_cache: Dict[str, TelegramClient] = {}
-    def get_client(sf: str):
-        """Возвращает подключенный client или None, если сессия не авторизована/битая."""
+
+    def persist(st: SessionState) -> None:
+        try:
+            session_stats_save(conn, st)
+        except Exception as exc:
+            log_warn(
+                f"⚠️ Не удалось сохранить состояние {st.session_file}: "
+                f"{type(exc).__name__}"
+            )
+
+    def retire_if_run_limit(st: SessionState) -> None:
+        sf = st.session_file
+        if (
+            max_attempts_per_session
+            and attempts_in_session.get(sf, 0) >= int(max_attempts_per_session)
+            and sf not in retired_for_run
+        ):
+            retired_for_run.add(sf)
+            log_info(
+                f"🛑 {sf}: достигнут лимит {max_attempts_per_session} "
+                "попыток за этот запуск; сессия больше не используется."
+            )
+
+    def get_client(sf: str) -> Optional[TelegramClient]:
         c = client_cache.get(sf)
         if c is not None:
             return c
+        st = state_by_sf[sf]
         try:
             c = _make_client(sf, api_id, api_hash)
-            st = state_by_sf.get(sf)
-            if st and st.banned:
-                st.banned = False
-                session_stats_save(conn, st)
-                log_info(f"♻️ Сессия {sf} снова авторизована и возвращена в работу")
-        except RuntimeError as e:
-            # Не валим весь прогон из-за одной сессии
-            st = state_by_sf.get(sf)
-            if st:
-                st.banned = True
-                st.fail += 1
-                st.attempts += 1
-                st.next_invite_at = max(st.next_invite_at, _now() + 3600)
-                try:
-                    session_stats_save(conn, st)
-                except Exception:
-                    pass
-            log_warn(f"⚠️ Пропуск сессии {sf}: {e}")
+            st.banned = False
+            _set_session_status(st, "active", "")
+            persist(st)
+            client_cache[sf] = c
+            return c
+        except RuntimeError:
+            st.banned = True
+            st.fail += 1
+            st.attempts += 1
+            _set_session_status(st, "unauthorized", "not_authorized")
+            retired_for_run.add(sf)
+            persist(st)
+            log_warn(f"⚠️ {sf}: сессия не авторизована; исключена из запуска.")
             return None
-        client_cache[sf] = c
-        return c
+        except (OSError, ConnectionError) as exc:
+            st.fail += 1
+            st.attempts += 1
+            st.blocked_until = max(st.blocked_until, _now() + 60)
+            _set_session_status(st, "temporary_blocked", type(exc).__name__)
+            persist(st)
+            log_warn(f"🌐 {sf}: ошибка подключения {type(exc).__name__}.")
+            return None
 
-    def close_all_clients() -> None:
-        for c in list(client_cache.values()):
+    def drop_client(sf: str) -> None:
+        c = client_cache.pop(sf, None)
+        if c is not None:
             try:
                 c.disconnect()
             except Exception:
                 pass
-        client_cache.clear()
+
+    def close_all_clients() -> None:
+        for sf in list(client_cache):
+            drop_client(sf)
+
+    def available_states(excluded: set[str]) -> List[SessionState]:
+        result: List[SessionState] = []
+        for st in states:
+            retire_if_run_limit(st)
+            _refresh_session_status(st)
+            if (
+                st.session_file in retired_for_run
+                or st.session_file in excluded
+                or st.banned
+                or st.status == "disabled"
+            ):
+                continue
+            result.append(st)
+        return result
 
     try:
         log_info(
-            f"🚀 Старт инвайта (PRO) в: {target_key}. Кандидатов: {len(users)}. Сессий: {len(session_files)}"
+            f"🚀 Старт инвайта v2.4 в {target_key}. "
+            f"Кандидатов={len(users)}, сессий={len(session_files)}, "
+            f"max_user_attempts={user_limit}"
         )
 
+        stop_all = False
         for raw in users:
-            # Night mode pause
+            if stop_all:
+                break
+
             if night_mode:
                 now = _now()
-                if _is_time_in_window(now, night_start[0], night_start[1], night_end[0], night_end[1]):
-                    sec_left = _seconds_until_window_end(now, night_start[0], night_start[1], night_end[0], night_end[1])
+                if _is_time_in_window(
+                    now,
+                    night_start[0], night_start[1],
+                    night_end[0], night_end[1],
+                ):
+                    sec_left = _seconds_until_window_end(
+                        now,
+                        night_start[0], night_start[1],
+                        night_end[0], night_end[1],
+                    )
                     if sec_left > 0:
-                        log_pause(f"🌙 Ночной режим: пауза до конца окна ({sec_left//60} мин).")
-                        time.sleep(sec_left + random.uniform(*night_sleep_jitter))
-            # normalize user
+                        log_pause(
+                            f"🌙 Ночной режим: пауза до конца окна "
+                            f"({sec_left // 60} мин)."
+                        )
+                        time.sleep(
+                            sec_left + random.uniform(*night_sleep_jitter)
+                        )
+
             user_key, user_id, username, entity = parse_user_ref(raw)
+            display_user = ("@" + username) if username else user_key
 
-            # Check only exclusions applicable to this target (plus global).
             if excluded_has(conn, user_key, target_key=target_key):
+                rsn = (
+                    excluded_reason(conn, user_key, target_key=target_key)
+                    or "excluded"
+                )
+                ledger_put(
+                    conn, target_key, user_key, user_id, username,
+                    "skip", f"excluded:{rsn}", count_attempt=False,
+                )
                 skip_cnt += 1
-                rsn = excluded_reason(conn, user_key, target_key=target_key) or "excluded"
-                ledger_put(conn, target_key, user_key, user_id, username, "skip", f"excluded:{rsn}")
                 continue
-
 
             prev = ledger_get(conn, target_key, user_key)
-            if prev and prev[0] in ("ok", "already", "privacy", "invalid"):
+            # Privacy/not-mutual are session-scoped in v2.4 and must not block
+            # other sessions. Only truly terminal target/global states skip here.
+            if prev and prev[0] in ("ok", "already", "invalid"):
                 skip_cnt += 1
                 continue
 
-            # cap attempts per user (in this run)
-            user_attempts[user_key] = user_attempts.get(user_key, 0) + 1
-            if max_user_attempts and user_attempts[user_key] > int(max_user_attempts):
-                ledger_put(conn, target_key, user_key, user_id, username, "skip", f"max_attempts={max_user_attempts}")
-                skip_cnt += 1
-                log_warn(f"⏭️ Пропуск (лимит попыток) для {('@'+username) if username else user_key}")
-                continue
+            attempts_for_user = 0
+            tried_sessions: set[str] = set()
+            completed = False
 
-            # apply per-session soft limits (hour/day)
-            if per_hour_limit or per_day_limit:
-                for _st in states:
-                    due = session_next_time_due_to_limits(_st, per_hour_limit, per_day_limit)
-                    if due and due > _now():
-                        _st.next_invite_at = max(_st.next_invite_at, due)
-
-            # pick session
-            st = _pick_best_session(states)
-            if st is None:
-                log_stop("⛔ Нет доступных сессий.")
-                break
-
-            # if all sessions are waiting, sleep until any ready
-            ready_at = max(st.blocked_until, st.frozen_until, st.next_invite_at)
-            if ready_at > _now():
-                _sleep_until_ready(states)
-
-            st = _pick_best_session(states)
-            if st is None:
-                log_stop("⛔ Нет доступных сессий.")
-                break
-
-            sf = st.session_file
-            if excluded_has(conn, user_key, target_key=target_key, session_file=sf):
-                skip_cnt += 1
-                rsn = excluded_reason(
-                    conn, user_key, target_key=target_key, session_file=sf
-                ) or "excluded"
-                ledger_put(conn, target_key, user_key, user_id, username, "skip", f"excluded:{rsn}")
-                continue
-
-            client = get_client(sf)
-            if client is None:
-                # сессия помечена как невалидная в get_client; пробуем следующую
-                continue
-
-            # jitter before action
-            time.sleep(delay + random.uniform(float(jitter_min), float(jitter_max)))
-
-            # Resolve both target and user independently in the selected session.
-            try:
-                target_entity = resolve_target_for_client(client, target)
-                invitee_entity = resolve_user_for_client(client, entity)
-            except ValueError:
-                ledger_put(conn, target_key, user_key, user_id, username, "failed", "cannot_resolve_in_session")
-                st.fail += 1
-                fail_cnt += 1
-                log_warn(f"⏭️ {sf}: не удалось резолвить пользователя {user_key} в этой сессии")
-                try:
-                    session_stats_save(conn, st)
-                except Exception:
-                    pass
-                continue
-            except Exception as exc:
-                st.fail += 1
-                fail_cnt += 1
-                st.blocked_until = max(st.blocked_until, _now() + 60)
-                log_warn(f"🌐 {sf}: не удалось резолвить цель/пользователя ({type(exc).__name__})")
-                try:
-                    session_stats_save(conn, st)
-                except Exception:
-                    pass
-                continue
-
-            try:
-                st.attempts += 1
-                attempts_in_session[sf] = attempts_in_session.get(sf, 0) + 1
-
-                client(InviteToChannelRequest(channel=target_entity, users=[invitee_entity]))
-
-                ledger_put(conn, target_key, user_key, user_id, username, "ok", f"session={sf}")
-                # consume rolling limits
-                session_consume_invite_token(st, per_hour_limit, per_day_limit)
-                ok_cnt += 1
-                st.ok += 1
-                ok_in_session[sf] = ok_in_session.get(sf, 0) + 1
-                st.last_invite_at = _now()
-                st.next_invite_at = st.last_invite_at + max(1.0, delay)
-
-                log_ok(f"✅ Инвайт отправлен: {('@'+username) if username else user_key} → {target_key} | {sf}")
-
-                # gentle adaptive delay
-                delay = min(10.0, max(1.5, delay + random.uniform(-0.15, 0.35)))
-
-                # planned rotation by successes on a session
-                if rotate_every and ok_in_session.get(sf, 0) >= int(rotate_every):
-                    ok_in_session[sf] = 0
-                    # add a small penalty so other sessions get picked
-                    st.next_invite_at = max(st.next_invite_at, _now() + random.uniform(3.0, 8.0))
-
-            except UserAlreadyParticipantError:
-                ledger_put(conn, target_key, user_key, user_id, username, "already", "уже участник")
-                skip_cnt += 1
-                log_info(f"👤 Уже в чате: {('@'+username) if username else user_key}")
-
-            except UserPrivacyRestrictedError:
-                ledger_put(conn, target_key, user_key, user_id, username, "privacy", "закрыты инвайты")
-                try:
-                    excluded_add(conn, user_key, user_id, username, "privacy", target_key=target_key, session_file=sf)
-                except Exception:
-                    pass
-                skip_cnt += 1
-                ses_stats[sf]["privacy"] += 1
-                log_warn(f"🔒 Закрыты инвайты: {('@'+username) if username else user_key}")
-
-            except UserNotMutualContactError:
-                ledger_put(conn, target_key, user_key, user_id, username, "skip", "not_mutual_contact")
-                try:
-                    excluded_add(conn, user_key, user_id, username, "not_mutual_contact", target_key=target_key, session_file=sf)
-                except Exception:
-                    pass
-                skip_cnt += 1
-                ses_stats[sf]["not_mutual"] += 1
-                log_warn(f"🙅‍♂️ Не взаимный контакт/нельзя инвайтить: {('@'+username) if username else user_key}")
-
-            except UserChannelsTooMuchError:
-                ledger_put(conn, target_key, user_key, user_id, username, "skip", "user_channels_too_much")
-                try:
-                    excluded_add(
-                        conn, user_key, user_id, username, "user_channels_too_much",
-                        target_key=target_key
+            while attempts_for_user < user_limit and not completed:
+                # Rolling hour/day limits become a next_invite_at gate.
+                for st in states:
+                    due = session_next_time_due_to_limits(
+                        st, per_hour_limit, per_day_limit
                     )
-                except Exception:
-                    pass
-                skip_cnt += 1
-                ses_stats[sf]["user_channels_too_much"] += 1
-                log_warn(f"📛 У пользователя слишком много чатов/каналов: {('@'+username) if username else user_key}")
+                    if due and due > _now():
+                        st.next_invite_at = max(st.next_invite_at, due)
+                        persist(st)
 
-            except UserKickedError:
-                ledger_put(conn, target_key, user_key, user_id, username, "skip", "user_kicked")
+                candidates = available_states(tried_sessions)
+
+                if not candidates:
+                    all_usable = available_states(set())
+                    if not all_usable:
+                        log_stop(
+                            "⛔ Не осталось доступных сессий для продолжения."
+                        )
+                        stop_all = True
+                        break
+                    # Every usable session was already tried for this user.
+                    # Start another pass only if the per-user cap permits it.
+                    tried_sessions.clear()
+                    candidates = all_usable
+
+                st = _pick_best_session(
+                    candidates,
+                    excluded=retired_for_run,
+                )
+                if st is None:
+                    stop_all = True
+                    log_stop("⛔ Планировщик не нашёл доступную сессию.")
+                    break
+
+                ready_at = max(
+                    st.blocked_until, st.frozen_until, st.next_invite_at
+                )
+                if ready_at > _now():
+                    # If another previously-tried session is already ready,
+                    # prefer a retry over an unnecessary long wait.
+                    fallback = _pick_best_session(
+                        available_states(set()),
+                        excluded=retired_for_run,
+                    )
+                    if fallback is not None and max(
+                        fallback.blocked_until,
+                        fallback.frozen_until,
+                        fallback.next_invite_at,
+                    ) <= _now():
+                        tried_sessions.clear()
+                        st = fallback
+                    else:
+                        _sleep_until_ready(
+                            candidates,
+                            excluded=retired_for_run,
+                        )
+                        st = _pick_best_session(
+                            candidates,
+                            excluded=retired_for_run,
+                        )
+                        if st is None:
+                            continue
+
+                sf = st.session_file
+
+                if excluded_has(
+                    conn,
+                    user_key,
+                    target_key=target_key,
+                    session_file=sf,
+                ):
+                    tried_sessions.add(sf)
+                    continue
+
+                client = get_client(sf)
+                if client is None:
+                    tried_sessions.add(sf)
+                    continue
+
+                attempts_for_user += 1
+                attempts_in_session[sf] += 1
+                st.attempts += 1
+                retire_after_attempt = False
+
                 try:
+                    try:
+                        target_entity = resolve_target_for_client(client, target)
+                        invitee_entity = resolve_user_for_client(client, entity)
+                    except ValueError:
+                        ses_stats[sf]["resolve"] += 1
+                        st.fail += 1
+                        fail_cnt += 1
+                        ledger_put(
+                            conn, target_key, user_key, user_id, username,
+                            "failed", "cannot_resolve_in_session",
+                            session_file=sf,
+                        )
+                        log_warn(
+                            f"⏭️ {sf}: не удалось резолвить {display_user}; "
+                            "пробую другую сессию."
+                        )
+                        tried_sessions.add(sf)
+                        continue
+                    except (OSError, ConnectionError) as exc:
+                        ses_stats[sf]["network"] += 1
+                        st.fail += 1
+                        fail_cnt += 1
+                        st.blocked_until = max(
+                            st.blocked_until, _now() + 60
+                        )
+                        _set_session_status(
+                            st, "temporary_blocked", type(exc).__name__
+                        )
+                        ledger_put(
+                            conn, target_key, user_key, user_id, username,
+                            "failed", type(exc).__name__,
+                            session_file=sf,
+                        )
+                        drop_client(sf)
+                        tried_sessions.add(sf)
+                        continue
+                    except Exception as exc:
+                        ses_stats[sf]["rpc_other"] += 1
+                        st.fail += 1
+                        fail_cnt += 1
+                        ledger_put(
+                            conn, target_key, user_key, user_id, username,
+                            "failed", f"resolve:{type(exc).__name__}",
+                            session_file=sf,
+                        )
+                        tried_sessions.add(sf)
+                        continue
+
+                    time.sleep(
+                        delay
+                        + random.uniform(
+                            float(jitter_min), float(jitter_max)
+                        )
+                    )
+                    client(
+                        InviteToChannelRequest(
+                            channel=target_entity,
+                            users=[invitee_entity],
+                        )
+                    )
+
+                    ledger_put(
+                        conn, target_key, user_key, user_id, username,
+                        "ok", "invited", session_file=sf,
+                    )
+                    session_consume_invite_token(
+                        st, per_hour_limit, per_day_limit
+                    )
+                    st.ok += 1
+                    st.last_invite_at = _now()
+                    st.next_invite_at = (
+                        st.last_invite_at + max(1.0, delay)
+                    )
+                    _set_session_status(st, "active", "")
+                    ses_stats[sf]["ok"] += 1
+                    ok_in_session[sf] += 1
+                    ok_cnt += 1
+                    completed = True
+                    log_ok(
+                        f"✅ {display_user} → {target_key} | {sf} "
+                        f"(попытка {attempts_for_user}/{user_limit})"
+                    )
+
+                    delay = min(
+                        10.0,
+                        max(
+                            1.5,
+                            delay + random.uniform(-0.15, 0.35),
+                        ),
+                    )
+                    if (
+                        rotate_every
+                        and ok_in_session[sf] >= int(rotate_every)
+                    ):
+                        ok_in_session[sf] = 0
+                        st.next_invite_at = max(
+                            st.next_invite_at,
+                            _now() + random.uniform(3.0, 8.0),
+                        )
+
+                except UserAlreadyParticipantError:
+                    ses_stats[sf]["already"] += 1
+                    ledger_put(
+                        conn, target_key, user_key, user_id, username,
+                        "already", "already_participant",
+                        session_file=sf,
+                    )
+                    skip_cnt += 1
+                    completed = True
+                    log_info(f"👤 Уже в цели: {display_user}")
+
+                except UserPrivacyRestrictedError:
+                    # Privacy is terminal for this run. Do not rotate accounts
+                    # to work around a user's privacy restriction.
+                    ses_stats[sf]["privacy"] += 1
+                    ledger_put(
+                        conn, target_key, user_key, user_id, username,
+                        "privacy", "privacy_restricted",
+                        session_file=sf,
+                    )
+                    excluded_add(
+                        conn, user_key, user_id, username, "privacy",
+                        target_key=target_key, session_file=sf,
+                    )
+                    skip_cnt += 1
+                    completed = True
+                    log_warn(f"🔒 Privacy restriction: {display_user}")
+
+                except UserNotMutualContactError:
+                    ses_stats[sf]["not_mutual"] += 1
+                    ledger_put(
+                        conn, target_key, user_key, user_id, username,
+                        "skip", "not_mutual_contact",
+                        session_file=sf,
+                    )
+                    excluded_add(
+                        conn, user_key, user_id, username,
+                        "not_mutual_contact",
+                        target_key=target_key, session_file=sf,
+                    )
+                    skip_cnt += 1
+                    completed = True
+                    log_warn(
+                        f"🙅 Нельзя пригласить {display_user}: "
+                        "не взаимный контакт."
+                    )
+
+                except UserChannelsTooMuchError:
+                    ses_stats[sf]["user_channels_too_much"] += 1
+                    ledger_put(
+                        conn, target_key, user_key, user_id, username,
+                        "skip", "user_channels_too_much",
+                        session_file=sf,
+                    )
+                    excluded_add(
+                        conn, user_key, user_id, username,
+                        "user_channels_too_much",
+                        target_key=target_key,
+                    )
+                    skip_cnt += 1
+                    completed = True
+
+                except UserKickedError:
+                    ses_stats[sf]["user_kicked"] += 1
+                    ledger_put(
+                        conn, target_key, user_key, user_id, username,
+                        "skip", "user_kicked",
+                        session_file=sf,
+                    )
                     excluded_add(
                         conn, user_key, user_id, username, "user_kicked",
-                        target_key=target_key
+                        target_key=target_key,
                     )
-                except Exception:
-                    pass
-                skip_cnt += 1
-                ses_stats[sf]["user_kicked"] += 1
-                log_warn(f"🚫 Пользователь кикнут/забанен в цели: {('@'+username) if username else user_key}")
+                    skip_cnt += 1
+                    completed = True
 
-            except UserBlockedError:
-                ledger_put(conn, target_key, user_key, user_id, username, "skip", "user_blocked")
-                try:
-                    excluded_add(conn, user_key, user_id, username, "user_blocked", target_key=target_key, session_file=sf)
-                except Exception:
-                    pass
-                skip_cnt += 1
-                ses_stats[sf]["user_blocked"] += 1
-                log_warn(f"🚫 Пользователь заблокирован/недоступен: {('@'+username) if username else user_key}")
+                except UserBlockedError:
+                    ses_stats[sf]["user_blocked"] += 1
+                    ledger_put(
+                        conn, target_key, user_key, user_id, username,
+                        "skip", "user_blocked",
+                        session_file=sf,
+                    )
+                    excluded_add(
+                        conn, user_key, user_id, username, "user_blocked",
+                        target_key=target_key, session_file=sf,
+                    )
+                    skip_cnt += 1
+                    completed = True
 
-            except ChatWriteForbiddenError as e:
-                # Обычно означает ограничение/запрет на стороне ИМЕННО этой сессии в цели.
-                diag = _diagnose_invite_context(client, target_entity)
-                ledger_put(conn, target_key, user_key, user_id, username, "forbidden", f"{type(e).__name__}")
-                st.fail += 1
-                fail_cnt += 1
-
-                # Не долбим эту сессию — отложим на 7 дней (можно поменять позже)
-                st.blocked_until = max(st.blocked_until, _now() + 7 * 24 * 3600)
-                log_warn(
-                    f"🚫 ChatWriteForbidden на {sf} при инвайте {('@'+username) if username else user_key} → {target_key}. "
-                    f"Диагностика: {diag}"
-                )
-
-            except FloodWaitError as e:
-                sec = int(getattr(e, "seconds", 0) or 0)
-                ledger_put(conn, target_key, user_key, user_id, username, "floodwait", f"{sec}")
-
-                st.fail += 1
-                fail_cnt += 1
-
-                # block this session for wait + buffer
-                st.blocked_until = max(st.blocked_until, _now() + sec + int(floodwait_buffer_seconds))
-
-                if sec > int(switch_on_floodwait_seconds):
-                    log_pause(f"💤 FloodWait {sec}s (>{switch_on_floodwait_seconds}). Блокирую {sf} и продолжаю другой сессией…")
-                else:
-                    log_pause(f"💤 FloodWait {sec}s. Блокирую {sf} и продолжаю…")
-
-                # backoff for global delay
-                delay = min(15.0, max(delay, 6.0))
-
-            except (UsernameInvalidError, UserIdInvalidError):
-                ledger_put(conn, target_key, user_key, user_id, username, "invalid", "некорректный пользователь")
-                try:
+                except (UsernameInvalidError, UserIdInvalidError):
+                    ses_stats[sf]["invalid"] += 1
+                    ledger_put(
+                        conn, target_key, user_key, user_id, username,
+                        "invalid", "invalid_user",
+                        session_file=sf,
+                    )
                     excluded_add(
                         conn, user_key, user_id, username, "invalid_user",
-                        global_scope=True
+                        global_scope=True,
                     )
-                except Exception:
-                    pass
+                    skip_cnt += 1
+                    completed = True
+                    log_warn(f"❌ Невалидный пользователь: {display_user}")
+
+                except (ChatWriteForbiddenError, ChatAdminRequiredError) as exc:
+                    # This is a problem with this inviter session for the
+                    # current target, not with the user being invited.
+                    ses_stats[sf]["forbidden"] += 1
+                    st.fail += 1
+                    fail_cnt += 1
+                    ledger_put(
+                        conn, target_key, user_key, user_id, username,
+                        "forbidden", type(exc).__name__,
+                        session_file=sf,
+                    )
+                    retired_for_run.add(sf)
+                    tried_sessions.add(sf)
+                    log_warn(
+                        f"🚫 {sf}: нет прав инвайта в {target_key}; "
+                        "исключаю только эту сессию из текущего запуска."
+                    )
+
+                except FloodWaitError as exc:
+                    sec = max(0, int(getattr(exc, "seconds", 0) or 0))
+                    ses_stats[sf]["floodwait"] += 1
+                    st.fail += 1
+                    fail_cnt += 1
+                    st.blocked_until = max(
+                        st.blocked_until,
+                        _now() + sec + int(floodwait_buffer_seconds),
+                    )
+                    _set_session_status(
+                        st, "flood_wait", f"{sec}s"
+                    )
+                    ledger_put(
+                        conn, target_key, user_key, user_id, username,
+                        "floodwait", f"{sec}",
+                        session_file=sf,
+                        flood_seconds=sec,
+                    )
+                    tried_sessions.add(sf)
+                    delay = min(15.0, max(delay, 6.0))
+                    log_pause(
+                        f"💤 {sf}: FloodWait {sec}s"
+                        + (
+                            f" (>{switch_on_floodwait_seconds})"
+                            if sec > int(switch_on_floodwait_seconds)
+                            else ""
+                        )
+                        + "; таймер сохраняю, текущего пользователя "
+                          "пробую другой доступной сессией."
+                    )
+
+                except PeerFloodError:
+                    ses_stats[sf]["peerflood"] += 1
+                    st.fail += 1
+                    fail_cnt += 1
+                    freeze_sec = max(
+                        1, int(peerflood_freeze_hours)
+                    ) * 3600
+                    st.frozen_until = max(
+                        st.frozen_until, _now() + freeze_sec
+                    )
+                    _set_session_status(
+                        st, "peer_flood",
+                        f"{peerflood_freeze_hours}h",
+                    )
+                    ledger_put(
+                        conn, target_key, user_key, user_id, username,
+                        "peerflood", "peer_flood",
+                        session_file=sf,
+                    )
+                    tried_sessions.add(sf)
+                    log_stop(
+                        f"⛔ {sf}: PeerFlood; заморожена на "
+                        f"{peerflood_freeze_hours}ч."
+                    )
+
+                except (ConnectionResetError, ConnectionError, OSError) as exc:
+                    ses_stats[sf]["network"] += 1
+                    st.fail += 1
+                    fail_cnt += 1
+                    st.blocked_until = max(
+                        st.blocked_until, _now() + 60
+                    )
+                    _set_session_status(
+                        st, "temporary_blocked", type(exc).__name__
+                    )
+                    ledger_put(
+                        conn, target_key, user_key, user_id, username,
+                        "failed", type(exc).__name__,
+                        session_file=sf,
+                    )
+                    drop_client(sf)
+                    tried_sessions.add(sf)
+                    log_warn(
+                        f"🌐 {sf}: {type(exc).__name__}; "
+                        "пауза 60с, пробую другую сессию."
+                    )
+
+                except RPCError as exc:
+                    ses_stats[sf]["rpc_other"] += 1
+                    st.fail += 1
+                    fail_cnt += 1
+                    ledger_put(
+                        conn, target_key, user_key, user_id, username,
+                        "failed", type(exc).__name__,
+                        session_file=sf,
+                    )
+                    tried_sessions.add(sf)
+                    log_warn(
+                        f"⚠️ {sf}: RPC {type(exc).__name__}; "
+                        "пробую другую сессию."
+                    )
+
+                except Exception as exc:
+                    ses_stats[sf]["other"] += 1
+                    st.fail += 1
+                    fail_cnt += 1
+                    ledger_put(
+                        conn, target_key, user_key, user_id, username,
+                        "failed", type(exc).__name__,
+                        session_file=sf,
+                    )
+                    tried_sessions.add(sf)
+                    log_warn(
+                        f"⚠️ {sf}: {type(exc).__name__}; "
+                        "пробую другую сессию."
+                    )
+
+                finally:
+                    persist(st)
+                    retire_if_run_limit(st)
+
+            if not completed and not stop_all:
+                exhausted_cnt += 1
                 skip_cnt += 1
-                ses_stats[sf]["invalid"] += 1
-                log_warn(f"❌ Невалидный пользователь: {raw}")
-
-            except ChatAdminRequiredError:
-                ledger_put(conn, target_key, user_key, user_id, username, "stop", "нет прав на инвайт")
-                log_stop(f"⛔ Нет прав на инвайт в {target_key}. Останавливаю прогон.")
-                break
-
-            except PeerFloodError:
-                ledger_put(conn, target_key, user_key, user_id, username, "peerflood", "PeerFlood/лимит на аккаунте")
-                st.fail += 1
-                fail_cnt += 1
-                # freeze session for long time
-                freeze_sec = int(peerflood_freeze_hours) * 3600
-                st.frozen_until = max(st.frozen_until, _now() + freeze_sec)
-                log_stop(f"⛔ PeerFlood на {sf}: замораживаю на {peerflood_freeze_hours}ч и продолжаю другой сессией.")
-            except ValueError:
-                ledger_put(conn, target_key, user_key, user_id, username, "failed", "cannot_resolve_in_session")
-                fail_cnt += 1
-                log_warn(f"⏭️ Не удалось резолвить {user_key} в текущей сессии.")
-
-            except (ConnectionResetError, ConnectionError, OSError) as e:
-                # Сетевой сбой/ресет соединения — не вина пользователя.
-                st.fail += 1
-                fail_cnt += 1
-                st.blocked_until = max(st.blocked_until, _now() + 60)
-                log_warn(f"🌐 Сеть/соединение для {sf}: {type(e).__name__}. Пауза 60с и продолжаю другой сессией…")
-                try:
-                    client.disconnect()
-                except Exception:
-                    pass
-
-            except RPCError as e:
-                ledger_put(conn, target_key, user_key, user_id, username, "failed", f"{type(e).__name__}")
-                st.fail += 1
-                fail_cnt += 1
-                log_warn(f"⚠️ Ошибка RPC ({type(e).__name__}) для {raw}")
-
-            except Exception as e:
-                ledger_put(conn, target_key, user_key, user_id, username, "failed", f"{type(e).__name__}")
-                st.fail += 1
-                fail_cnt += 1
-                log_warn(f"⚠️ Неизвестная ошибка ({type(e).__name__}) для {raw}")
-
-            # persist session state
-            try:
-                session_stats_save(conn, st)
-            except Exception:
-                pass
-
-            # per-session attempt cap (if enabled)
-            if max_attempts_per_session and attempts_in_session.get(sf, 0) >= int(max_attempts_per_session):
-                attempts_in_session[sf] = 0
-                st.next_invite_at = max(st.next_invite_at, _now() + random.uniform(10.0, 25.0))
-                log_info(f"🔁 Лимит попыток на {sf}: делаю паузу для этой сессии.")
-
-        log_ok(f"🏁 Инвайт завершён. Успех: {ok_cnt}, пропуск: {skip_cnt}, ошибки: {fail_cnt}")
-
-        # Session summary (helps to understand why some accounts fail)
-        try:
-            for sf in session_files:
-                s = ses_stats.get(sf) or {}
-                log_info(
-                    f"📊 Итоги сессии {sf}: "
-                    f"ok={s.get('ok',0)} forbidden={s.get('forbidden',0)} privacy={s.get('privacy',0)} "
-                    f"not_mutual={s.get('not_mutual',0)} user_blocked={s.get('user_blocked',0)} user_kicked={s.get('user_kicked',0)} "
-                    f"user_channels_too_much={s.get('user_channels_too_much',0)} "
-                    f"floodwait={s.get('floodwait',0)} peerflood={s.get('peerflood',0)} network={s.get('network',0)} "
-                    f"invalid={s.get('invalid',0)} rpc_other={s.get('rpc_other',0)} other={s.get('other',0)}"
+                ledger_put(
+                    conn, target_key, user_key, user_id, username,
+                    "skip", f"max_user_attempts={user_limit}",
+                    count_attempt=False,
                 )
-        except Exception:
-            pass
+                log_warn(
+                    f"⏭️ {display_user}: исчерпан лимит "
+                    f"{user_limit} попыток."
+                )
 
+        log_ok(
+            f"🏁 Инвайт завершён. Успех={ok_cnt}, пропуск={skip_cnt}, "
+            f"ошибок попыток={fail_cnt}, исчерпан лимит={exhausted_cnt}"
+        )
+        for sf in session_files:
+            st = state_by_sf[sf]
+            _refresh_session_status(st)
+            persist(st)
+            stats = ses_stats[sf]
+            log_info(
+                f"📊 {sf}: status={st.status} "
+                f"attempts_run={attempts_in_session[sf]} "
+                f"ok={stats['ok']} already={stats['already']} "
+                f"privacy={stats['privacy']} forbidden={stats['forbidden']} "
+                f"floodwait={stats['floodwait']} "
+                f"peerflood={stats['peerflood']} "
+                f"network={stats['network']} resolve={stats['resolve']} "
+                f"invalid={stats['invalid']} rpc={stats['rpc_other']} "
+                f"other={stats['other']}"
+            )
     finally:
         close_all_clients()
         conn.close()
+
 
 def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[Union[str, int]], base_delay: float = 2.0) -> None:
     """Инвайт одним клиентом (1 сессия).
