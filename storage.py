@@ -16,7 +16,7 @@ from typing import Any, Iterable, List, Optional
 
 
 DB_PATH = "invite_ledger.db"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -103,6 +103,61 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS invites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target TEXT NOT NULL,
+            user_key TEXT NOT NULL,
+            user_id INTEGER,
+            username TEXT,
+            status TEXT NOT NULL,
+            reason TEXT,
+            ts TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_inv_unique "
+        "ON invites(target, user_key)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_stats (
+            session_file TEXT PRIMARY KEY,
+            blocked_until REAL DEFAULT 0,
+            frozen_until REAL DEFAULT 0,
+            banned INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'active',
+            status_reason TEXT DEFAULT '',
+            ok INTEGER DEFAULT 0,
+            fail INTEGER DEFAULT 0,
+            attempts INTEGER DEFAULT 0,
+            last_invite_at REAL DEFAULT 0,
+            next_invite_at REAL DEFAULT 0,
+            hour_window_start REAL DEFAULT 0,
+            hour_count INTEGER DEFAULT 0,
+            day_window_start REAL DEFAULT 0,
+            day_count INTEGER DEFAULT 0,
+            updated_at TEXT
+        )
+        """
+    )
+    session_cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(session_stats)").fetchall()
+    }
+    if "status" not in session_cols:
+        conn.execute(
+            "ALTER TABLE session_stats "
+            "ADD COLUMN status TEXT DEFAULT 'active'"
+        )
+    if "status_reason" not in session_cols:
+        conn.execute(
+            "ALTER TABLE session_stats "
+            "ADD COLUMN status_reason TEXT DEFAULT ''"
+        )
+
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS invite_state (
             target TEXT NOT NULL,
             user_key TEXT NOT NULL,
@@ -152,11 +207,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    # One-time compatibility migration from the v2.3 snapshot table.
-    old_invites = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='invites'"
+    # Import the legacy invite snapshot exactly once.
+    legacy_imported = conn.execute(
+        "SELECT value FROM schema_meta "
+        "WHERE key='legacy_invites_imported'"
     ).fetchone()
-    if old_invites:
+    if not legacy_imported:
         conn.execute(
             """
             INSERT OR IGNORE INTO invite_state(
@@ -166,6 +222,13 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             SELECT target, user_key, user_id, username, status, reason,
                    NULL, 1, ts
             FROM invites
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO schema_meta(key, value)
+            VALUES('legacy_invites_imported', '1')
+            ON CONFLICT(key) DO UPDATE SET value='1'
             """
         )
     conn.execute(
@@ -179,6 +242,17 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
 
 def connect_db(path: str = DB_PATH) -> sqlite3.Connection:
+    if os.name != "nt" and not os.path.exists(path):
+        try:
+            fd = os.open(
+                path,
+                os.O_CREAT | os.O_EXCL | os.O_RDWR,
+                0o600,
+            )
+            os.close(fd)
+        except FileExistsError:
+            pass
+
     conn = sqlite3.connect(path)
     ensure_schema(conn)
     if os.name != "nt":
@@ -213,7 +287,8 @@ def upsert_user(
     username = _clean_username(getattr(user, "username", None))
     first_name = getattr(user, "first_name", None)
     last_name = getattr(user, "last_name", None)
-    now = seen_at or utcnow_iso()
+    parsed_now = utcnow_iso()
+    observed_at = seen_at or parsed_now
     source_id_text = str(source_id) if source_id is not None else None
     source_key = f"{source_type}:{source_id_text or 'unknown'}"
 
@@ -231,7 +306,11 @@ def upsert_user(
             source_id=excluded.source_id,
             source_title=excluded.source_title,
             source_type=excluded.source_type,
-            last_seen_at=excluded.last_seen_at
+            last_seen_at=CASE
+                WHEN users.last_seen_at >= excluded.last_seen_at
+                    THEN users.last_seen_at
+                ELSE excluded.last_seen_at
+            END
         """,
         (
             uid,
@@ -241,8 +320,8 @@ def upsert_user(
             source_id_text,
             source_title,
             source_type,
-            now,
-            now,
+            parsed_now,
+            observed_at,
         ),
     )
     conn.execute(
@@ -254,9 +333,21 @@ def upsert_user(
         VALUES(?,?,?,?,?,?,?)
         ON CONFLICT(user_id, source_key) DO UPDATE SET
             source_title=excluded.source_title,
-            last_seen_at=excluded.last_seen_at
+            last_seen_at=CASE
+                WHEN user_sources.last_seen_at >= excluded.last_seen_at
+                    THEN user_sources.last_seen_at
+                ELSE excluded.last_seen_at
+            END
         """,
-        (uid, source_key, source_id_text, source_title, source_type, now, now),
+        (
+            uid,
+            source_key,
+            source_id_text,
+            source_title,
+            source_type,
+            parsed_now,
+            observed_at,
+        ),
     )
     return uid
 
@@ -468,6 +559,7 @@ def invite_record(
     session_file: Optional[str] = None,
     flood_seconds: Optional[int] = None,
     count_attempt: bool = True,
+    commit: bool = True,
 ) -> None:
     """Append one immutable event and update the current invite state."""
     now = utcnow_iso()
@@ -522,7 +614,8 @@ def invite_record(
             attempt_delta,
         ),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def invite_event_count(
