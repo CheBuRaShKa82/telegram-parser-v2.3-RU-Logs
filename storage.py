@@ -16,13 +16,14 @@ from typing import Any, Iterable, List, Optional
 
 
 DB_PATH = "invite_ledger.db"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 @dataclass(frozen=True)
 class UserCandidate:
     user_id: Optional[int]
     username: Optional[str]
+    preferred_session: Optional[str] = None
 
     @property
     def key(self) -> str:
@@ -77,6 +78,21 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY(user_id, source_key)
         )
         """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_session_seen (
+            user_id INTEGER NOT NULL,
+            session_file TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            PRIMARY KEY(user_id, session_file)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_user_session_seen_last "
+        "ON user_session_seen(user_id, last_seen_at DESC)"
     )
     conn.execute(
         """
@@ -278,6 +294,7 @@ def upsert_user(
     source_title: Optional[str],
     source_type: str,
     seen_at: Optional[str] = None,
+    session_file: Optional[str] = None,
 ) -> Optional[int]:
     uid = getattr(user, "id", None)
     if uid is None:
@@ -349,22 +366,100 @@ def upsert_user(
             observed_at,
         ),
     )
+    if session_file:
+        session_name = os.path.basename(str(session_file))
+        conn.execute(
+            """
+            INSERT INTO user_session_seen(
+                user_id, session_file, first_seen_at, last_seen_at
+            )
+            VALUES(?,?,?,?)
+            ON CONFLICT(user_id, session_file) DO UPDATE SET
+                last_seen_at=CASE
+                    WHEN user_session_seen.last_seen_at >= excluded.last_seen_at
+                        THEN user_session_seen.last_seen_at
+                    ELSE excluded.last_seen_at
+                END
+            """,
+            (uid, session_name, parsed_now, observed_at),
+        )
+
     return uid
 
 
-def load_user_candidates(conn: sqlite3.Connection) -> List[UserCandidate]:
+def load_user_candidates(
+    conn: sqlite3.Connection,
+    *,
+    source_id: Optional[str] = None,
+    source_type: Optional[str] = None,
+) -> List[UserCandidate]:
+    where: List[str] = []
+    params: List[Any] = []
+
+    if source_id is not None:
+        where.append(
+            "EXISTS (SELECT 1 FROM user_sources us "
+            "WHERE us.user_id=u.user_id AND us.source_id=?)"
+        )
+        params.append(str(source_id))
+    if source_type is not None:
+        where.append(
+            "EXISTS (SELECT 1 FROM user_sources us "
+            "WHERE us.user_id=u.user_id AND us.source_type=?)"
+        )
+        params.append(str(source_type))
+
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
     rows = conn.execute(
         """
-        SELECT user_id, username
-        FROM users
-        ORDER BY last_seen_at DESC, user_id ASC
+        SELECT
+            u.user_id,
+            u.username,
+            (
+                SELECT ss.session_file
+                FROM user_session_seen ss
+                WHERE ss.user_id=u.user_id
+                ORDER BY ss.last_seen_at DESC, ss.session_file ASC
+                LIMIT 1
+            ) AS preferred_session
+        FROM users u
+        """
+        + where_sql
+        + " ORDER BY u.last_seen_at DESC, u.user_id ASC",
+        params,
+    ).fetchall()
+    return [
+        UserCandidate(
+            user_id=int(uid),
+            username=_clean_username(username),
+            preferred_session=(
+                str(preferred_session)
+                if preferred_session is not None
+                else None
+            ),
+        )
+        for uid, username, preferred_session in rows
+    ]
+
+
+def list_user_sources(conn: sqlite3.Connection) -> List[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT source_id, source_title, source_type, COUNT(DISTINCT user_id)
+        FROM user_sources
+        GROUP BY source_id, source_title, source_type
+        ORDER BY MAX(last_seen_at) DESC, source_title ASC
         """
     ).fetchall()
     return [
-        UserCandidate(user_id=int(uid), username=_clean_username(username))
-        for uid, username in rows
+        {
+            "source_id": row[0],
+            "source_title": row[1],
+            "source_type": row[2],
+            "users": int(row[3] or 0),
+        }
+        for row in rows
     ]
-
 
 def candidate_from_raw(raw: Any) -> UserCandidate:
     if isinstance(raw, UserCandidate):
