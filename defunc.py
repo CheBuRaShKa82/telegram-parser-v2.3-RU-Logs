@@ -1528,7 +1528,7 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
             try:
                 excluded_add(
                     conn, user_key, user_id, username, "privacy",
-                    target_key=target_key, session_file=sf
+                    target_key=target_key
                 )
             except Exception:
                 pass
@@ -1540,7 +1540,7 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
             try:
                 excluded_add(
                     conn, user_key, user_id, username, "not_mutual_contact",
-                    target_key=target_key, session_file=sf
+                    target_key=target_key
                 )
             except Exception:
                 pass
@@ -1576,7 +1576,7 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
             try:
                 excluded_add(
                     conn, user_key, user_id, username, "user_blocked",
-                    target_key=target_key, session_file=sf
+                    target_key=target_key
                 )
             except Exception:
                 pass
@@ -1620,14 +1620,9 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
             break
 
         except ValueError:
-            ledger_put(conn, target_key, user_key, user_id, username, "skip", "нет access_hash / не могу резолвить по id")
-            try:
-                excluded_add(conn, user_key, user_id, username, "no_access_hash")
-                excluded_cache.add(user_key)
-            except Exception:
-                pass
-            skip_cnt += 1
-            log_warn(f"⏭️ Пропуск: не могу инвайтить {raw} (нужен @username или id:access_hash).")
+            ledger_put(conn, target_key, user_key, user_id, username, "failed", "cannot_resolve_in_session")
+            fail_cnt += 1
+            log_warn(f"⏭️ Не удалось резолвить {user_key} в текущей сессии.")
 
         except (ConnectionResetError, ConnectionError, OSError) as e:
             ledger_put(conn, target_key, user_key, user_id, username, "failed", f"{type(e).__name__}")
