@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+from getpass import getpass
 import time
 from datetime import datetime
 from typing import List
@@ -94,7 +95,7 @@ def config() -> None:
             options[0] = input("Введите API_ID: ").strip() + "\n"
         elif key == "2":
             os.system("cls||clear")
-            options[1] = input("Введите API_HASH: ").strip() + "\n"
+            options[1] = getpass("Введите API_HASH (ввод скрыт): ").strip() + "\n"
         elif key == "3":
             options[2] = (
                 "False\n" if options[2].strip() == "True" else "True\n"
