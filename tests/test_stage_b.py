@@ -93,7 +93,7 @@ class SessionSchedulerTests(unittest.TestCase):
     def test_session_status_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = os.path.join(tmp, "state.db")
-            with patch.object(defunc, "LEDGER_DB", db):
+            with patch.object(inviter, "LEDGER_DB", db):
                 conn = inviter._db()
                 states = inviter.session_stats_load(conn, ["a.session"])
                 st = states["a.session"]
@@ -137,13 +137,13 @@ class RetryIntegrationTests(unittest.TestCase):
                 return clients[session_file]
 
             with (
-                patch.object(defunc, "LEDGER_DB", db),
-                patch.object(defunc, "_make_client", side_effect=make_client),
+                patch.object(inviter, "LEDGER_DB", db),
+                patch.object(inviter, "_make_client", side_effect=make_client),
                 patch.object(
-                    defunc, "resolve_target_for_client", return_value=object()
+                    inviter, "resolve_target_for_client", return_value=object()
                 ),
                 patch.object(
-                    defunc, "resolve_user_for_client", return_value=object()
+                    inviter, "resolve_user_for_client", return_value=object()
                 ),
                 patch.object(inviter.time, "sleep", return_value=None),
             ):
