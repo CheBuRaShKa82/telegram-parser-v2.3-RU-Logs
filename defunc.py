@@ -2777,10 +2777,13 @@ def preflight_sessions_for_target(
 # -------------------------------------------------------------------
 # (Опционально) экспортируем публичные функции для удобного импорта
 __all__ = [
+    "ParserFilterConfig",
     "config",
     "getoptions",
     "parsing",
     "parsing_from_messages",
+    "parsing_channel_comments",
+    "export_users",
     "inviting",
     "inviting_rotate_sessions",
     "preflight_sessions_for_target",
