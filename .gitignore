@@ -4,8 +4,8 @@ sessoins/
 *.session-journal
 
 # Local configuration and secrets
-options.txt
-config.json
+options.txt*
+config.json*
 .env
 .env.*
 
@@ -14,7 +14,7 @@ invite_ledger.db
 invite_ledger.db-*
 *.db-wal
 *.db-shm
-app.log
+app.log*
 *.log
 
 # Parsed/exported user data
