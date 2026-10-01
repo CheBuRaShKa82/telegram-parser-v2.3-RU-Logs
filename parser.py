@@ -23,6 +23,9 @@ from telethon.tl.types import (
 )
 
 from logging_setup import log_info, log_ok, log_warn
+DB_PATH = "invite_ledger.db"
+
+
 from storage import (
     checkpoint_clear,
     checkpoint_get,
@@ -241,7 +244,7 @@ def parsing(
     total = 0
     kept = 0
     skipped: Dict[str, int] = {}
-    conn = connect_db()
+    conn = connect_db(DB_PATH)
     source_id, source_title, source_type = _source_metadata(
         chat_entity, "participants"
     )
@@ -352,7 +355,7 @@ def parsing_from_messages(
         datetime.now(timezone.utc) - timedelta(days=max_age_days)
         if max_age_days > 0 else None
     )
-    conn = connect_db()
+    conn = connect_db(DB_PATH)
     source_id, source_title, source_type = _source_metadata(
         chat_entity, "messages"
     )
@@ -541,7 +544,7 @@ def parsing_channel_comments(
         channel, "channel_comments"
     )
     cp_key = _parser_checkpoint_key(source_id, source_title, source_type)
-    conn = connect_db()
+    conn = connect_db(DB_PATH)
     cp = checkpoint_get(conn, cp_key) if resume else None
     offset_id = int(cp.cursor_int) if cp and cp.cursor_int else 0
     if not resume:
@@ -712,7 +715,7 @@ def export_users(
     formats: Tuple[str, ...] = ("csv", "json", "txt"),
 ) -> Dict[str, str]:
     """Export the canonical SQLite user database."""
-    conn = connect_db()
+    conn = connect_db(DB_PATH)
     try:
         rows = export_users_rows(conn)
     finally:
