@@ -1005,21 +1005,16 @@ def inviting_rotate_sessions(
             user_key, user_id, username, entity = parse_user_ref(raw)
             display_user = ("@" + username) if username else user_key
 
+            prev = ledger_get(conn, target_key, user_key)
+
             if excluded_has(conn, user_key, target_key=target_key):
-                rsn = (
-                    excluded_reason(conn, user_key, target_key=target_key)
-                    or "excluded"
-                )
-                ledger_put(
-                    conn, target_key, user_key, user_id, username,
-                    "skip", f"excluded:{rsn}", count_attempt=False,
-                )
+                # Do not append a new event on every run for a persistent
+                # exclusion; the original reason already exists in storage.
                 skip_cnt += 1
                 continue
 
-            prev = ledger_get(conn, target_key, user_key)
-            # Privacy/not-mutual are session-scoped in v2.4 and must not block
-            # other sessions. Only truly terminal target/global states skip here.
+            # Terminal target/global states skip future attempts. Session-scoped
+            # exclusions are evaluated later against each individual session.
             if prev and prev[0] in ("ok", "already", "invalid"):
                 skip_cnt += 1
                 continue
@@ -1068,11 +1063,12 @@ def inviting_rotate_sessions(
                         stop_all = True
                         break
                     if not eligible_for_user:
-                        ledger_put(
-                            conn, target_key, user_key, user_id, username,
-                            "skip", "excluded_all_sessions",
-                            count_attempt=False,
-                        )
+                        if prev != ("skip", "excluded_all_sessions"):
+                            ledger_put(
+                                conn, target_key, user_key, user_id, username,
+                                "skip", "excluded_all_sessions",
+                                count_attempt=False,
+                            )
                         skip_cnt += 1
                         completed = True
                         log_info(
