@@ -20,8 +20,11 @@ from telethon.sync import TelegramClient
 from defunc import (
     config,
     getoptions,
+    ParserFilterConfig,
     parsing,
     parsing_from_messages,
+    parsing_channel_comments,
+    export_users,
     inviting,
     inviting_rotate_sessions,
     preflight_sessions_for_target,
@@ -92,6 +95,30 @@ def pick_dialog(client: TelegramClient, title: str):
 
 def clear() -> None:
     os.system("cls||clear")
+
+
+def ask_parser_filters() -> ParserFilterConfig:
+    print("\n=== ФИЛЬТР ПОЛЬЗОВАТЕЛЕЙ ===")
+    print("Enter = безопасные значения по умолчанию.")
+    require_username = yn("Требовать username? (y/n, default n): ")
+    require_photo = yn("Требовать фото профиля? (y/n, default n): ")
+    raw_days = input(
+        "Активность: 0=не учитывать, 7/30/90 дней (default 0): "
+    ).strip()
+    try:
+        active_days = int(raw_days) if raw_days else 0
+    except ValueError:
+        active_days = 0
+    if active_days not in (0, 7, 30, 90):
+        active_days = 0
+    return ParserFilterConfig(
+        exclude_bots=True,
+        exclude_deleted=True,
+        exclude_scam_fake=True,
+        require_username=require_username,
+        require_photo=require_photo,
+        active_days=active_days,
+    )
 
 
 def list_sessions() -> List[str]:
@@ -195,8 +222,16 @@ def do_parsing() -> None:
         client.disconnect()
         return
     try:
-        parsing(client, src, parse_id=parse_id, parse_name=parse_name)
-        print("Готово. Смотри usernames.txt / userids.txt и app.log")
+        filters = ask_parser_filters()
+        parsing(
+            client,
+            src,
+            parse_id=parse_id,
+            parse_name=parse_name,
+            filters=filters,
+            checkpoint_batch=100,
+        )
+        print("Готово. Основная база: invite_ledger.db; TXT — совместимый экспорт.")
     finally:
         client.disconnect()
         time.sleep(1.5)
@@ -275,6 +310,9 @@ def do_parsing_messages() -> None:
     if max_days > 30:
         print("⚠️ Возраст 30+ дней увеличит время и снизит качество базы.", flush=True)
 
+    filters = ask_parser_filters()
+    resume = yn("Продолжить с последнего checkpoint, если он есть? (y/n): ")
+
     try:
         print("Запускаю парсинг из сообщений…", flush=True)
         parsing_from_messages(
@@ -284,11 +322,100 @@ def do_parsing_messages() -> None:
             parse_name=parse_name,
             limit_messages=limit_messages,
             max_age_days=max_days,
+            filters=filters,
+            checkpoint_batch=100,
+            resume=resume,
         )
         print("Готово. Смотри usernames.txt / userids.txt и app.log")
     finally:
         client.disconnect()
         time.sleep(1.5)
+
+
+def do_parsing_comments() -> None:
+    clear()
+    opts = getoptions()
+    if opts[0].strip() in ("NONEID", "") or opts[1].strip() in ("NONEHASH", ""):
+        print("Сначала задай API_ID и API_HASH в Настройках.")
+        time.sleep(2)
+        return
+
+    sess = pick_session()
+    if not sess:
+        return
+
+    api_id = int(opts[0].strip())
+    api_hash = opts[1].strip()
+    client = make_client(sess, api_id, api_hash)
+    src = pick_dialog(client, "Broadcast-канал с комментариями: ")
+    if not src:
+        client.disconnect()
+        return
+
+    parse_name = yn("Экспортировать usernames? (y/n): ")
+    parse_id = yn("Экспортировать user ids? (y/n): ")
+    if not (parse_name or parse_id):
+        print("SQLite всё равно хранит user_id; включаю ID-экспорт.")
+        parse_id = True
+
+    posts_raw = input("Сколько постов смотреть? (default 200): ").strip()
+    comments_raw = input(
+        "Максимум комментариев на пост (0 = все, default 0): "
+    ).strip()
+    days_raw = input(
+        "Макс. возраст постов в днях (0 = без ограничения, default 30): "
+    ).strip()
+
+    try:
+        limit_posts = int(posts_raw) if posts_raw else 200
+    except ValueError:
+        limit_posts = 200
+    try:
+        comments_per_post = int(comments_raw) if comments_raw else 0
+    except ValueError:
+        comments_per_post = 0
+    try:
+        max_days = int(days_raw) if days_raw else 30
+    except ValueError:
+        max_days = 30
+
+    filters = ask_parser_filters()
+    resume = yn("Продолжить с последнего checkpoint, если он есть? (y/n): ")
+
+    try:
+        parsing_channel_comments(
+            client,
+            src,
+            parse_id=parse_id,
+            parse_name=parse_name,
+            limit_posts=max(1, limit_posts),
+            comments_per_post=max(0, comments_per_post),
+            max_age_days=max(0, max_days),
+            filters=filters,
+            checkpoint_batch=10,
+            resume=resume,
+        )
+        print(
+            "Готово. Это активная аудитория из комментариев, "
+            "а не полный список подписчиков."
+        )
+    except ValueError as exc:
+        print(f"Ошибка: {exc}")
+    finally:
+        client.disconnect()
+        time.sleep(1.5)
+
+
+def do_export_users() -> None:
+    clear()
+    paths = export_users(formats=("csv", "json", "txt"))
+    print("Экспорт завершён:")
+    if not paths:
+        print("Нет данных для экспорта.")
+    else:
+        for fmt, path in paths.items():
+            print(f"  {fmt.upper()}: {path}")
+    input("Нажми Enter...")
 
 
 def do_inviting() -> None:
@@ -471,12 +598,14 @@ def do_inviting() -> None:
 def main() -> None:
     while True:
         clear()
-        print("=== TELEGRAM PARSER / INVITER v2.3 ===")
+        print("=== TELEGRAM PARSER / INVITER v2.4 ===")
         print("1 - Настройки")
-        print("2 - Парсинг участников (если список виден)")
-        print("3 - Парсинг из сообщений (если список скрыт)")
-        print("4 - Инвайт из usernames.txt / userids.txt (с учётом ledger)")
-        print("5 - Выход")
+        print("2 - Парсинг видимых участников")
+        print("3 - Парсинг активных авторов сообщений")
+        print("4 - Парсинг авторов комментариев канала")
+        print("5 - Экспорт SQLite → CSV / JSON / TXT")
+        print("6 - Инвайт из базы пользователей")
+        print("7 - Выход")
         key = input("Ввод: ").strip()
 
         if key == "1":
@@ -486,8 +615,12 @@ def main() -> None:
         elif key == "3":
             do_parsing_messages()
         elif key == "4":
-            do_inviting()
+            do_parsing_comments()
         elif key == "5":
+            do_export_users()
+        elif key == "6":
+            do_inviting()
+        elif key == "7":
             break
         else:
             print("Неверный пункт.")
