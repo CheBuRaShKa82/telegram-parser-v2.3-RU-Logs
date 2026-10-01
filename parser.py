@@ -155,6 +155,10 @@ def _append_unique(path: str, values: Iterable[str], prefix_at: bool = False) ->
         return 0
 
     with open(path, "a", encoding="utf-8") as f:
+        for value in new_vals:
+            f.write(value + "\n")
+    return len(new_vals)
+
 
 def _source_metadata(
     chat_entity: Any,
