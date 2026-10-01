@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import defunc
+import parser as parser_mod
 from storage import checkpoint_get, connect_db, export_users_rows
 
 
@@ -75,7 +75,7 @@ class ParserFilterTests(unittest.TestCase):
             fake=False,
             status=None,
         )
-        self.assertEqual(defunc.quality_user(user)[0], True)
+        self.assertEqual(parser_mod.quality_user(user)[0], True)
 
     def test_optional_username_filter_is_enforced(self):
         user = SimpleNamespace(
@@ -88,22 +88,22 @@ class ParserFilterTests(unittest.TestCase):
             fake=False,
             status=None,
         )
-        cfg = defunc.ParserFilterConfig(require_username=True)
-        ok, reason = defunc.quality_user(user, cfg)
+        cfg = parser_mod.ParserFilterConfig(require_username=True)
+        ok, reason = parser_mod.quality_user(user, cfg)
         self.assertFalse(ok)
         self.assertEqual(reason, "нет username")
 
 
 class SourceMetadataTests(unittest.TestCase):
     def test_manual_source_gets_stable_checkpoint_identity(self):
-        source_id, source_title, source_type = defunc._source_metadata(
+        source_id, source_title, source_type = parser_mod._source_metadata(
             "@manual_group", "messages"
         )
         self.assertEqual(source_id, "@manual_group")
         self.assertEqual(source_title, "@manual_group")
         self.assertEqual(source_type, "messages")
         self.assertEqual(
-            defunc._parser_checkpoint_key(
+            parser_mod._parser_checkpoint_key(
                 source_id, source_title, source_type
             ),
             "messages:@manual_group",
@@ -137,7 +137,7 @@ class ParserCheckpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db = os.path.join(tmp, "parser.db")
             with patch.object(defunc, "LEDGER_DB", db):
-                defunc.parsing_from_messages(
+                parser_mod.parsing_from_messages(
                     client,
                     SimpleNamespace(id=777, title="Chat"),
                     parse_id=False,
@@ -147,7 +147,7 @@ class ParserCheckpointTests(unittest.TestCase):
                     checkpoint_batch=1,
                     resume=True,
                 )
-                defunc.parsing_from_messages(
+                parser_mod.parsing_from_messages(
                     client,
                     SimpleNamespace(id=777, title="Chat"),
                     parse_id=False,
@@ -191,7 +191,7 @@ class ParticipantCheckpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db = os.path.join(tmp, "participants.db")
             with patch.object(defunc, "LEDGER_DB", db):
-                defunc.parsing(
+                parser_mod.parsing(
                     BrokenParticipantsClient(),
                     SimpleNamespace(id=321, title="Group"),
                     parse_id=False,
@@ -244,7 +244,7 @@ class ChannelCommentsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db = os.path.join(tmp, "comments.db")
             with patch.object(defunc, "LEDGER_DB", db):
-                defunc.parsing_channel_comments(
+                parser_mod.parsing_channel_comments(
                     client,
                     channel,
                     parse_id=False,
@@ -289,7 +289,7 @@ class ExportTests(unittest.TestCase):
             conn.close()
 
             with patch.object(defunc, "LEDGER_DB", db):
-                paths = defunc.export_users(out)
+                paths = parser_mod.export_users(out)
 
             self.assertEqual(set(paths), {"csv", "json", "txt"})
             for path in paths.values():
