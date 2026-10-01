@@ -14,6 +14,8 @@ import os
 import time
 import random
 import re
+import csv
+import json
 import logging
 import sqlite3
 from pathlib import Path
@@ -23,6 +25,9 @@ from typing import Iterable, List, Optional, Tuple, Union, Dict, Any
 from storage import (
     UserCandidate,
     candidate_from_raw,
+    checkpoint_clear,
+    checkpoint_get,
+    checkpoint_put,
     connect_db,
     exclusion_add,
     exclusion_has,
@@ -30,12 +35,18 @@ from storage import (
     exclusion_reason,
     invite_record,
     invite_state_get,
+    export_users_rows,
     upsert_user,
 )
 
 from telethon.sync import TelegramClient
 from telethon import utils as tl_utils
-from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest, GetParticipantRequest
+from telethon.tl.functions.channels import (
+    InviteToChannelRequest,
+    JoinChannelRequest,
+    GetParticipantRequest,
+    GetFullChannelRequest,
+)
 from telethon.tl.types import (
     UserStatusOnline,
     UserStatusRecently,
@@ -272,52 +283,86 @@ def getoptions() -> List[str]:
     with open("options.txt", "r", encoding="utf-8") as f:
         return f.readlines()
 
-# -------------------- QUALITY FILTER (HARD) --------------------
+# -------------------- PARSER FILTERS --------------------
 
-def _is_active(status) -> bool:
-    """Жёстко считаем активным: online/recently/last week или offline был в последние 7 дней."""
+@dataclass(frozen=True)
+class ParserFilterConfig:
+    exclude_bots: bool = True
+    exclude_deleted: bool = True
+    exclude_scam_fake: bool = True
+    require_username: bool = False
+    require_photo: bool = False
+    active_days: int = 0  # 0 = activity is ignored
+
+
+DEFAULT_PARSER_FILTERS = ParserFilterConfig()
+
+
+def _is_active_within(status: Any, days: int) -> bool:
+    """Best-effort activity check for Telegram's coarse presence statuses."""
+    if days <= 0:
+        return True
     if status is None:
         return False
-    if isinstance(status, (UserStatusOnline, UserStatusRecently, UserStatusLastWeek)):
+    if isinstance(status, UserStatusOnline):
         return True
+    if isinstance(status, UserStatusRecently):
+        return days >= 3
+    if isinstance(status, UserStatusLastWeek):
+        return days >= 7
+    if isinstance(status, UserStatusLastMonth):
+        return days >= 30
     if isinstance(status, UserStatusOffline):
         try:
-            # was_online обычно tz-aware (UTC)
             was = status.was_online
             if was is None:
                 return False
             now = datetime.now(timezone.utc)
-            return (now - was) <= timedelta(days=7)
+            if was.tzinfo is None:
+                was = was.replace(tzinfo=timezone.utc)
+            return (now - was) <= timedelta(days=days)
         except Exception:
             return False
-    # LastMonth считаем уже слабым для жёсткого фильтра
     return False
 
-def quality_hard(user) -> Tuple[bool, str]:
-    """
-    Жёсткий фильтр качества (язык НЕ учитываем):
-    - не бот
-    - не deleted
-    - не scam/fake (если поле есть)
-    - есть username
-    - есть фото
-    - активен (online/recently/last week или был онлайн <=7 дней)
-    """
-    if getattr(user, "bot", False):
+
+def quality_user(
+    user: Any,
+    filters: Optional[ParserFilterConfig] = None,
+) -> Tuple[bool, str]:
+    filters = filters or DEFAULT_PARSER_FILTERS
+    if filters.exclude_bots and getattr(user, "bot", False):
         return False, "бот"
-    if getattr(user, "deleted", False):
+    if filters.exclude_deleted and getattr(user, "deleted", False):
         return False, "удалён"
-    if getattr(user, "scam", False):
+    if filters.exclude_scam_fake and getattr(user, "scam", False):
         return False, "scam"
-    if getattr(user, "fake", False):
+    if filters.exclude_scam_fake and getattr(user, "fake", False):
         return False, "fake"
-    if not getattr(user, "username", None):
+    if filters.require_username and not getattr(user, "username", None):
         return False, "нет username"
-    if not getattr(user, "photo", None):
+    if filters.require_photo and not getattr(user, "photo", None):
         return False, "нет фото"
-    if not _is_active(getattr(user, "status", None)):
+    if filters.active_days > 0 and not _is_active_within(
+        getattr(user, "status", None), filters.active_days
+    ):
         return False, "не активен"
     return True, "ok"
+
+
+def quality_hard(user: Any) -> Tuple[bool, str]:
+    """Legacy v2.3 hard filter kept for compatibility."""
+    return quality_user(
+        user,
+        ParserFilterConfig(
+            exclude_bots=True,
+            exclude_deleted=True,
+            exclude_scam_fake=True,
+            require_username=True,
+            require_photo=True,
+            active_days=7,
+        ),
+    )
 
 # -------------------- DEDUP HELPERS --------------------
 
