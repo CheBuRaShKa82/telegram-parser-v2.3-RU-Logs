@@ -28,6 +28,8 @@ from storage import (
     exclusion_has,
     exclusion_load_keys,
     exclusion_reason,
+    invite_record,
+    invite_state_get,
     upsert_user,
 )
 
@@ -381,6 +383,8 @@ def _db() -> sqlite3.Connection:
             blocked_until REAL DEFAULT 0,
             frozen_until REAL DEFAULT 0,
             banned INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'active',
+            status_reason TEXT DEFAULT '',
             ok INTEGER DEFAULT 0,
             fail INTEGER DEFAULT 0,
             attempts INTEGER DEFAULT 0,
@@ -393,26 +397,63 @@ def _db() -> sqlite3.Connection:
             updated_at TEXT
         )
     """)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(session_stats)").fetchall()}
+    if "status" not in cols:
+        conn.execute("ALTER TABLE session_stats ADD COLUMN status TEXT DEFAULT 'active'")
+    if "status_reason" not in cols:
+        conn.execute("ALTER TABLE session_stats ADD COLUMN status_reason TEXT DEFAULT ''")
     conn.commit()
     return conn
 
-def ledger_get(conn: sqlite3.Connection, target: str, user_key: str) -> Optional[Tuple[str, str]]:
-    cur = conn.execute(
-        "SELECT status, reason FROM invites WHERE target=? AND user_key=? LIMIT 1",
-        (target, user_key),
-    )
-    row = cur.fetchone()
-    return (row[0], row[1]) if row else None
+def ledger_get(
+    conn: sqlite3.Connection,
+    target: str,
+    user_key: str,
+) -> Optional[Tuple[str, str]]:
+    return invite_state_get(conn, target, user_key)
 
-def ledger_put(conn: sqlite3.Connection, target: str, user_key: str, user_id: Optional[int],
-               username: Optional[str], status: str, reason: str = "") -> None:
+
+def ledger_put(
+    conn: sqlite3.Connection,
+    target: str,
+    user_key: str,
+    user_id: Optional[int],
+    username: Optional[str],
+    status: str,
+    reason: str = "",
+    *,
+    session_file: Optional[str] = None,
+    flood_seconds: Optional[int] = None,
+    count_attempt: bool = True,
+) -> None:
+    invite_record(
+        conn,
+        target=target,
+        user_key=user_key,
+        user_id=user_id,
+        username=username,
+        status=status,
+        reason=reason,
+        session_file=session_file,
+        flood_seconds=flood_seconds,
+        count_attempt=count_attempt,
+    )
+    # Keep the v2.3 snapshot table updated for backwards compatibility.
     ts = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        "INSERT OR REPLACE INTO invites(target, user_key, user_id, username, status, reason, ts) VALUES (?,?,?,?,?,?,?)",
+        """
+        INSERT INTO invites(target, user_key, user_id, username, status, reason, ts)
+        VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(target, user_key) DO UPDATE SET
+            user_id=excluded.user_id,
+            username=excluded.username,
+            status=excluded.status,
+            reason=excluded.reason,
+            ts=excluded.ts
+        """,
         (target, user_key, user_id, username, status, reason, ts),
     )
     conn.commit()
-
 
 
 # -------------------- SESSION STATS (SQLite) --------------------
@@ -488,7 +529,7 @@ def session_stats_load(conn: sqlite3.Connection, session_files: List[str]) -> Di
     now = _now()
     for sf in session_files:
         cur = conn.execute(
-            "SELECT blocked_until,frozen_until,banned,ok,fail,attempts,last_invite_at,next_invite_at,"
+            "SELECT blocked_until,frozen_until,banned,status,status_reason,ok,fail,attempts,last_invite_at,next_invite_at,"
             "hour_window_start,hour_count,day_window_start,day_count FROM session_stats WHERE session_file=?",
             (sf,),
         )
@@ -498,15 +539,17 @@ def session_stats_load(conn: sqlite3.Connection, session_files: List[str]) -> Di
             st.blocked_until = float(row[0] or 0)
             st.frozen_until = float(row[1] or 0)
             st.banned = bool(row[2] or 0)
-            st.ok = int(row[3] or 0)
-            st.fail = int(row[4] or 0)
-            st.attempts = int(row[5] or 0)
-            st.last_invite_at = float(row[6] or 0)
-            st.next_invite_at = float(row[7] or 0)
-            st.hour_window_start = float(row[8] or 0)
-            st.hour_count = int(row[9] or 0)
-            st.day_window_start = float(row[10] or 0)
-            st.day_count = int(row[11] or 0)
+            st.status = str(row[3] or "active")
+            st.status_reason = str(row[4] or "")
+            st.ok = int(row[5] or 0)
+            st.fail = int(row[6] or 0)
+            st.attempts = int(row[7] or 0)
+            st.last_invite_at = float(row[8] or 0)
+            st.next_invite_at = float(row[9] or 0)
+            st.hour_window_start = float(row[10] or 0)
+            st.hour_count = int(row[11] or 0)
+            st.day_window_start = float(row[12] or 0)
+            st.day_count = int(row[13] or 0)
         else:
             st = SessionState(session_file=sf)
             conn.execute(
@@ -527,13 +570,15 @@ def session_stats_load(conn: sqlite3.Connection, session_files: List[str]) -> Di
 
 def session_stats_save(conn: sqlite3.Connection, st: "SessionState") -> None:
     conn.execute(
-        "UPDATE session_stats SET blocked_until=?, frozen_until=?, banned=?, ok=?, fail=?, attempts=?, "
+        "UPDATE session_stats SET blocked_until=?, frozen_until=?, banned=?, status=?, status_reason=?, ok=?, fail=?, attempts=?, "
         "last_invite_at=?, next_invite_at=?, hour_window_start=?, hour_count=?, day_window_start=?, day_count=?, updated_at=? "
         "WHERE session_file=?",
         (
             float(st.blocked_until or 0),
             float(st.frozen_until or 0),
             1 if st.banned else 0,
+            str(getattr(st, "status", "active") or "active"),
+            str(getattr(st, "status_reason", "") or ""),
             int(st.ok or 0),
             int(st.fail or 0),
             int(st.attempts or 0),
@@ -828,6 +873,8 @@ class SessionState:
     blocked_until: float = 0.0   # unix timestamp
     frozen_until: float = 0.0    # unix timestamp (PeerFlood etc)
     banned: bool = False
+    status: str = "active"
+    status_reason: str = ""
     last_invite_at: float = 0.0
     next_invite_at: float = 0.0
     hour_window_start: float = 0.0
@@ -837,6 +884,27 @@ class SessionState:
     ok: int = 0
     fail: int = 0
     attempts: int = 0
+
+
+def _set_session_status(st: SessionState, status: str, reason: str = "") -> None:
+    st.status = status
+    st.status_reason = reason
+
+
+def _refresh_session_status(st: SessionState) -> None:
+    now = time.time()
+    if st.banned:
+        _set_session_status(st, "unauthorized", st.status_reason or "not_authorized")
+        return
+    if st.frozen_until > now:
+        _set_session_status(st, "peer_flood", st.status_reason or "peer_flood")
+        return
+    if st.blocked_until > now:
+        if st.status not in ("flood_wait", "temporary_blocked"):
+            _set_session_status(st, "temporary_blocked", st.status_reason)
+        return
+    if st.status != "disabled":
+        _set_session_status(st, "active", "")
 
 
 def _now() -> float:
@@ -874,12 +942,16 @@ def _seconds_until_window_end(now_sec: float, start_h: int, start_m: int, end_h:
     return max(0, minutes_left * 60)
 
 
-def _pick_best_session(states: List[SessionState]) -> Optional[SessionState]:
-    """Pick best available session: not banned, not frozen/blocked, earliest next_invite_at."""
-    now = _now()
+def _pick_best_session(
+    states: List[SessionState],
+    excluded: Optional[set[str]] = None,
+) -> Optional[SessionState]:
+    """Pick the next usable session, excluding sessions retired for this user/run."""
+    excluded = excluded or set()
     candidates = []
     for st in states:
-        if st.banned:
+        _refresh_session_status(st)
+        if st.session_file in excluded or st.banned or st.status == "disabled":
             continue
         ready_at = max(st.blocked_until, st.frozen_until, st.next_invite_at)
         candidates.append((ready_at, st.last_invite_at, st.attempts, st))
@@ -890,16 +962,22 @@ def _pick_best_session(states: List[SessionState]) -> Optional[SessionState]:
     return candidates[0][3]
 
 
-def _sleep_until_ready(states: List[SessionState], extra_jitter: Tuple[float, float] = (2.0, 6.0)) -> None:
+def _sleep_until_ready(
+    states: List[SessionState],
+    excluded: Optional[set[str]] = None,
+    extra_jitter: Tuple[float, float] = (2.0, 6.0),
+) -> None:
     """If no session is ready now, sleep until the earliest ready moment (plus jitter).
 
     v10.1: Writes a clear message when ALL sessions are waiting, so it doesn't look like the bot froze.
     For long waits, sleeps in chunks and prints progress occasionally.
     """
     now = _now()
+    excluded = excluded or set()
     soonest = None
     for st in states:
-        if st.banned:
+        _refresh_session_status(st)
+        if st.session_file in excluded or st.banned or st.status == "disabled":
             continue
         ready_at = max(st.blocked_until, st.frozen_until, st.next_invite_at)
         if soonest is None or ready_at < soonest:
