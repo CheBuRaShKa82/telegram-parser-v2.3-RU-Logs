@@ -8,6 +8,7 @@ portable user identifiers because they are session-specific.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -113,6 +114,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 def connect_db(path: str = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     ensure_schema(conn)
+    if os.name != "nt":
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
     return conn
 
 
