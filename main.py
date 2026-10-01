@@ -613,12 +613,7 @@ def do_inviting() -> None:
         "TXT-файлы — только legacy/export."
     )
 
-    finally:
-        try:
-            client.disconnect()
-        except Exception:
-            pass
-        time.sleep(1.5)
+    time.sleep(1.5)
 
 
 def main() -> None:
