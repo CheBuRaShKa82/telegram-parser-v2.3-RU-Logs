@@ -954,12 +954,14 @@ def _pick_best_session(
         if st.session_file in excluded or st.banned or st.status == "disabled":
             continue
         ready_at = max(st.blocked_until, st.frozen_until, st.next_invite_at)
-        candidates.append((ready_at, st.last_invite_at, st.attempts, st))
+        candidates.append(
+            (ready_at, st.last_invite_at, st.attempts, st.session_file, st)
+        )
     if not candidates:
         return None
-    # prefer already-ready, else earliest ready time
-    candidates.sort(key=lambda x: (x[0], x[1], x[2]))
-    return candidates[0][3]
+    # Stable string tie-breaker avoids comparing SessionState objects.
+    candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+    return candidates[0][4]
 
 
 def _sleep_until_ready(
