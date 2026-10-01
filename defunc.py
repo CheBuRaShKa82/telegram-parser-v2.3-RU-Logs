@@ -167,6 +167,11 @@ SESSIONS_DIR = "sessoins"  # намеренно как в сообщении п�
 def ensure_sessions_dir() -> str:
     """Создаёт папку для сессий и возвращает её путь."""
     Path(SESSIONS_DIR).mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        try:
+            os.chmod(SESSIONS_DIR, 0o700)
+        except OSError:
+            pass
     # Мягкая миграция: если старые .session лежат рядом со скриптом — перенесём их в sessoins/
     try:
         for sf in Path(".").glob("*.session"):
@@ -176,6 +181,12 @@ def ensure_sessions_dir() -> str:
             if dst.exists():
                 continue
             sf.rename(dst)
+        if os.name != "nt":
+            for session_path in Path(SESSIONS_DIR).glob("*.session"):
+                try:
+                    os.chmod(session_path, 0o600)
+                except OSError:
+                    pass
     except Exception:
         pass
     return SESSIONS_DIR
@@ -240,6 +251,11 @@ def ensure_options() -> None:
     if not os.path.exists("options.txt"):
         with open("options.txt", "w", encoding="utf-8") as f:
             f.writelines(DEFAULT_OPTIONS)
+        if os.name != "nt":
+            try:
+                os.chmod("options.txt", 0o600)
+            except OSError:
+                pass
         return
 
     # если файл пустой — тоже восстановим
@@ -1664,8 +1680,9 @@ def _create_account_session(api_id: int, api_hash: str) -> None:
         time.sleep(1.5)
         return
 
-    # ВАЖНО: session = path/name (БЕЗ .session). Telethon создаст sessoins/<phone>.session
-    session_name = session_name_from_file(f"{phone}.session")
+    # Не используем номер телефона в имени session-файла.
+    alias = datetime.now().strftime("account_%Y%m%d_%H%M%S")
+    session_name = session_name_from_file(f"{alias}.session")
     client = TelegramClient(session_name, api_id, api_hash, flood_sleep_threshold=0)
     print("Сейчас придёт код в Telegram. Введите код и (если спросит) пароль 2FA.")
     client.start(phone=phone)
@@ -1676,7 +1693,7 @@ def _create_account_session(api_id: int, api_hash: str) -> None:
         except OSError:
             pass
 
-    log_ok(f"📲 Аккаунт добавлен: {phone}.session (папка {SESSIONS_DIR}/)")
+    log_ok(f"📲 Аккаунт добавлен: {alias}.session (папка {SESSIONS_DIR}/)")
     print("Готово. Сессия создана.")
     time.sleep(1.5)
 
@@ -1741,6 +1758,11 @@ def config() -> None:
         # сохраняем изменения настроек
         with open("options.txt", "w", encoding="utf-8") as f:
             f.writelines(options)
+        if os.name != "nt":
+            try:
+                os.chmod("options.txt", 0o600)
+            except OSError:
+                pass
 
         # небольшая пауза, чтобы меню не "мигало"
         time.sleep(0.2)
