@@ -667,16 +667,31 @@ def session_consume_invite_token(st: "SessionState", per_hour_limit: int, per_da
         st.day_count = int(getattr(st, "day_count", 0) or 0) + 1
 # -------------------- CORE OPS --------------------
 
-def _source_metadata(chat_entity: Any, source_type: str) -> Tuple[Optional[str], Optional[str], str]:
+def _source_metadata(
+    chat_entity: Any,
+    source_type: str,
+) -> Tuple[Optional[str], Optional[str], str]:
     source_id = getattr(chat_entity, "id", None)
     source_title = getattr(chat_entity, "title", None)
     if source_title is None:
         source_title = getattr(chat_entity, "username", None)
     try:
-        if source_id is None:
+        if source_id is None and not isinstance(chat_entity, (str, int)):
             source_id = tl_utils.get_peer_id(chat_entity)
     except Exception:
         pass
+
+    # Manual @username / t.me link / numeric ID must get its own stable
+    # checkpoint instead of collapsing into "unknown".
+    if source_id is None and isinstance(chat_entity, int):
+        source_id = chat_entity
+    if source_id is None and isinstance(chat_entity, str):
+        raw = chat_entity.strip()
+        if raw:
+            source_id = raw
+            if not source_title:
+                source_title = raw
+
     return (
         str(source_id) if source_id is not None else None,
         str(source_title) if source_title else None,
