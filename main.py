@@ -14,7 +14,13 @@ import os
 import time
 from typing import Any, List, Optional, Union
 
-from storage import UserCandidate, candidate_from_raw, connect_db, load_user_candidates
+from storage import (
+    UserCandidate,
+    candidate_from_raw,
+    connect_db,
+    list_user_sources,
+    load_user_candidates,
+)
 from telethon.sync import TelegramClient
 
 from config_ui import config, getoptions
@@ -237,22 +243,30 @@ def do_parsing() -> None:
         time.sleep(1.5)
 
 
-def _load_users_from_files() -> List[Union[UserCandidate, str, int]]:
-    """Load the canonical SQLite user queue; fall back to legacy TXT exports."""
+def _load_users_from_files(
+    *,
+    source_id: Optional[str] = None,
+    source_type: Optional[str] = None,
+) -> List[Union[UserCandidate, str, int]]:
+    """Load SQLite queue; legacy TXT fallback is used only for the full queue."""
     conn = connect_db()
     try:
-        candidates = load_user_candidates(conn)
+        candidates = load_user_candidates(
+            conn,
+            source_id=source_id,
+            source_type=source_type,
+        )
     finally:
         conn.close()
-    if candidates:
+    if candidates or source_id is not None or source_type is not None:
         return candidates
 
     legacy: List[Union[UserCandidate, str, int]] = []
     for path in ("userids.txt", "usernames.txt"):
         if not os.path.exists(path):
             continue
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
                 raw = line.strip()
                 if not raw:
                     continue
@@ -269,6 +283,42 @@ def _load_users_from_files() -> List[Union[UserCandidate, str, int]]:
         seen.add(candidate.key)
         uniq.append(candidate)
     return uniq
+
+
+def pick_user_queue() -> List[Union[UserCandidate, str, int]]:
+    conn = connect_db()
+    try:
+        sources = list_user_sources(conn)
+    finally:
+        conn.close()
+
+    if not sources:
+        return _load_users_from_files()
+
+    print("\n=== ИСТОЧНИК ПОЛЬЗОВАТЕЛЕЙ ===")
+    print("0. Вся база")
+    for index, source in enumerate(sources, 1):
+        title = source.get("source_title") or source.get("source_id") or "unknown"
+        source_type = source.get("source_type") or "unknown"
+        count = source.get("users") or 0
+        print(f"{index}. {title} [{source_type}] — {count} users")
+
+    raw = input("Выбери источник очереди (default 0): ").strip()
+    if not raw:
+        return _load_users_from_files()
+    if not raw.isdigit():
+        return []
+    index = int(raw)
+    if index == 0:
+        return _load_users_from_files()
+    if index < 1 or index > len(sources):
+        return []
+
+    selected = sources[index - 1]
+    return _load_users_from_files(
+        source_id=selected.get("source_id"),
+        source_type=selected.get("source_type"),
+    )
 
 
 def do_parsing_messages() -> None:
@@ -443,7 +493,7 @@ def do_inviting() -> None:
     # Важно: делаем target переносимым между сессиями
     target = target_ref(target_entity)
 
-    users = _load_users_from_files()
+    users = pick_user_queue()
     if not users:
         print("Списки пустые. Сначала сделай Парсинг.")
         client.disconnect()
