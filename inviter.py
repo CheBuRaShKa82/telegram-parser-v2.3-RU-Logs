@@ -39,6 +39,7 @@ from telethon.tl.functions.channels import (
     InviteToChannelRequest,
     JoinChannelRequest,
 )
+from telethon.tl.functions.messages import AddChatUserRequest
 
 from logging_setup import log_info, log_ok, log_pause, log_stop, log_warn
 from sessions import session_name_from_file
@@ -405,19 +406,64 @@ def session_consume_invite_token(st: "SessionState", per_hour_limit: int, per_da
         st.day_count = int(getattr(st, "day_count", 0) or 0) + 1
 # -------------------- CORE OPS --------------------
 
-def _target_key(target: Any) -> str:
-    """Стабильный ключ для target в ledger."""
+def canonical_target_key(target: Any) -> str:
+    """Return one canonical ledger key for entity/ref/username forms."""
+    if isinstance(target, str):
+        raw = target.strip()
+        if not raw:
+            return "ref:"
+        if raw.startswith("@"):
+            return "@" + raw[1:].lower()
+
+        # Public t.me/username and telegram.me/username links.
+        match = re.match(
+            r"^(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]+)(?:/.*)?$",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return "@" + match.group(1).lower()
+
+        if raw.lower().startswith("id:"):
+            maybe_id = raw[3:].strip()
+            if re.fullmatch(r"-?\d+", maybe_id):
+                return f"peer:{int(maybe_id)}"
+
+        if re.fullmatch(r"-?\d+", raw):
+            return f"peer:{int(raw)}"
+
+        return "ref:" + raw.lower()
+
+    if isinstance(target, int):
+        return f"peer:{int(target)}"
+
     try:
-        uname = getattr(target, "username", None)
-        if uname:
-            return "@" + str(uname)
-        tid = getattr(target, "id", None)
-        if tid is not None:
-            return f"id:{tid}"
+        username = getattr(target, "username", None)
+        if username:
+            return "@" + str(username).lstrip("@").lower()
     except Exception:
         pass
-    return str(target)
 
+    try:
+        peer_id = tl_utils.get_peer_id(target)
+        if isinstance(peer_id, int):
+            return f"peer:{peer_id}"
+    except Exception:
+        pass
+
+    try:
+        target_id = getattr(target, "id", None)
+        if target_id is not None:
+            return f"peer:{int(target_id)}"
+    except Exception:
+        pass
+
+    return "ref:" + str(target).strip().lower()
+
+
+def _target_key(target: Any) -> str:
+    """Backward-compatible alias for the canonical target key."""
+    return canonical_target_key(target)
 
 def target_ref(target: Any) -> Union[str, int, Any]:
     """Удобная "ссылка" на target, которую можно резолвить в других сессиях.
@@ -431,7 +477,7 @@ def target_ref(target: Any) -> Union[str, int, Any]:
     try:
         uname = getattr(target, "username", None)
         if uname:
-            return "@" + str(uname)
+            return "@" + str(uname).lstrip("@").lower()
         # get_peer_id работает и для каналов/чатов/юзеров
         try:
             pid = tl_utils.get_peer_id(target)
@@ -454,6 +500,54 @@ def resolve_target_for_client(client: TelegramClient, target: Any) -> Any:
         return client.get_input_entity(ref)
     except Exception:
         return client.get_entity(ref)
+
+
+def _basic_chat_id(target_entity: Any) -> Optional[int]:
+    """Return chat_id for legacy/basic Telegram groups, else None."""
+    cls_name = type(target_entity).__name__
+    if cls_name in ("Chat", "PeerChat", "InputPeerChat"):
+        value = getattr(target_entity, "chat_id", None)
+        if value is None:
+            value = getattr(target_entity, "id", None)
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _invite_one(
+    client: TelegramClient,
+    target_entity: Any,
+    invitee_entity: Any,
+) -> Any:
+    """Invite one user using the request appropriate for the target type."""
+    chat_id = _basic_chat_id(target_entity)
+    if chat_id is not None:
+        return client(
+            AddChatUserRequest(
+                chat_id=chat_id,
+                user_id=invitee_entity,
+                fwd_limit=10,
+            )
+        )
+    return client(
+        InviteToChannelRequest(
+            channel=target_entity,
+            users=[invitee_entity],
+        )
+    )
+
+
+def _has_missing_invitee(result: Any) -> bool:
+    """InviteToChannel may return success envelope with missing_invitees."""
+    missing = getattr(result, "missing_invitees", None)
+    if missing is None:
+        return False
+    try:
+        return len(missing) > 0
+    except TypeError:
+        return bool(missing)
 
 
 def _make_client(session_file: str, api_id: int, api_hash: str) -> TelegramClient:
@@ -966,20 +1060,53 @@ def inviting_rotate_sessions(
                         st.next_invite_at = max(st.next_invite_at, due)
                         persist(st)
 
-                candidates = available_states(tried_sessions)
+                candidates = [
+                    candidate
+                    for candidate in available_states(tried_sessions)
+                    if not excluded_has(
+                        conn,
+                        user_key,
+                        target_key=target_key,
+                        session_file=candidate.session_file,
+                    )
+                ]
 
                 if not candidates:
                     all_usable = available_states(set())
+                    eligible_for_user = [
+                        candidate
+                        for candidate in all_usable
+                        if not excluded_has(
+                            conn,
+                            user_key,
+                            target_key=target_key,
+                            session_file=candidate.session_file,
+                        )
+                    ]
                     if not all_usable:
                         log_stop(
                             "⛔ Не осталось доступных сессий для продолжения."
                         )
                         stop_all = True
                         break
-                    # Every usable session was already tried for this user.
-                    # Start another pass only if the per-user cap permits it.
+                    if not eligible_for_user:
+                        ledger_put(
+                            conn, target_key, user_key, user_id, username,
+                            "skip", "excluded_all_sessions",
+                            count_attempt=False,
+                        )
+                        skip_cnt += 1
+                        completed = True
+                        log_info(
+                            f"⏭️ {display_user}: исключён для всех "
+                            "доступных сессий."
+                        )
+                        break
+
+                    # All eligible sessions were already tried for this user.
+                    # Start another pass only while the per-user cap permits it.
                     tried_sessions.clear()
-                    candidates = all_usable
+                    candidates = eligible_for_user
 
                 st = _pick_best_session(
                     candidates,
@@ -1020,15 +1147,6 @@ def inviting_rotate_sessions(
                             continue
 
                 sf = st.session_file
-
-                if excluded_has(
-                    conn,
-                    user_key,
-                    target_key=target_key,
-                    session_file=sf,
-                ):
-                    tried_sessions.add(sf)
-                    continue
 
                 client = get_client(sf)
                 if client is None:
@@ -1095,12 +1213,24 @@ def inviting_rotate_sessions(
                             float(jitter_min), float(jitter_max)
                         )
                     )
-                    client(
-                        InviteToChannelRequest(
-                            channel=target_entity,
-                            users=[invitee_entity],
-                        )
+                    invite_result = _invite_one(
+                        client,
+                        target_entity,
+                        invitee_entity,
                     )
+                    if _has_missing_invitee(invite_result):
+                        ledger_put(
+                            conn, target_key, user_key, user_id, username,
+                            "skip", "missing_invitee",
+                            session_file=sf,
+                        )
+                        skip_cnt += 1
+                        completed = True
+                        log_warn(
+                            f"⏭️ Telegram не добавил {display_user}: "
+                            "missing_invitees."
+                        )
+                        continue
 
                     ledger_put(
                         conn, target_key, user_key, user_id, username,
@@ -1448,7 +1578,19 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
 
             try:
                 invitee_entity = resolve_user_for_client(client, entity)
-                client(InviteToChannelRequest(channel=target_entity, users=[invitee_entity]))
+                invite_result = _invite_one(client, target_entity, invitee_entity)
+                if _has_missing_invitee(invite_result):
+                    ledger_put(
+                        conn, target_key, user_key, user_id, username,
+                        "skip", "missing_invitee",
+                    )
+                    skip_cnt += 1
+                    log_warn(
+                        f"⏭️ Telegram не добавил "
+                        f"{('@'+username) if username else user_key}: "
+                        "missing_invitees."
+                    )
+                    continue
                 ledger_put(conn, target_key, user_key, user_id, username, "ok", "ok")
                 ok_cnt += 1
                 log_ok(f"✅ Инвайт отправлен: {('@'+username) if username else user_key} → {target_key}")
