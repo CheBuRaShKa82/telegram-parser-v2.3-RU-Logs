@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import inviter
 from storage import (
+    UserCandidate,
     connect_db,
     invite_event_count,
     invite_record,
@@ -151,7 +152,7 @@ class RetryIntegrationTests(unittest.TestCase):
                     api_hash="hash",
                     session_files=["a.session", "b.session"],
                     target="@target",
-                    users=[__import__('storage').UserCandidate(42, "tester")],
+                    users=[UserCandidate(42, "tester")],
                     base_delay=1.0,
                     jitter_min=0.0,
                     jitter_max=0.0,
