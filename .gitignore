@@ -18,6 +18,7 @@ app.log
 *.log
 
 # Parsed/exported user data
+exports/
 usernames.txt
 userids.txt
 *.csv
