@@ -1,0 +1,73 @@
+name: v2.4 smoke
+
+on:
+  push:
+    branches:
+      - fix/v2.4-audit
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile Python sources
+        run: python -m py_compile main.py defunc.py storage.py
+      - name: Storage smoke test
+        run: |
+          python - <<'PY'
+          import os
+          import tempfile
+          from types import SimpleNamespace
+
+          from storage import (
+              candidate_from_raw,
+              connect_db,
+              exclusion_add,
+              exclusion_has,
+              load_user_candidates,
+              upsert_user,
+          )
+
+          with tempfile.TemporaryDirectory() as tmp:
+              db = os.path.join(tmp, "test.db")
+              conn = connect_db(db)
+              user = SimpleNamespace(
+                  id=123456,
+                  username="example_user",
+                  first_name="Test",
+                  last_name="User",
+              )
+              upsert_user(
+                  conn,
+                  user,
+                  source_id="-1001",
+                  source_title="Test source",
+                  source_type="participants",
+              )
+              conn.commit()
+              users = load_user_candidates(conn)
+              assert len(users) == 1
+              assert users[0].user_id == 123456
+              assert candidate_from_raw("123456:999999").user_id == 123456
+
+              exclusion_add(
+                  conn,
+                  "id:123456",
+                  user_id=123456,
+                  username="example_user",
+                  reason="target_only",
+                  target_key="@target-a",
+              )
+              assert exclusion_has(conn, "id:123456", target_key="@target-a")
+              assert not exclusion_has(conn, "id:123456", target_key="@target-b")
+              conn.close()
+          PY
