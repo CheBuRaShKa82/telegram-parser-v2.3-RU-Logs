@@ -16,7 +16,7 @@ from typing import Any, Iterable, List, Optional
 
 
 DB_PATH = "invite_ledger.db"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -101,6 +101,58 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_user_exclusions_session ON user_exclusions(session_file)"
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS invite_state (
+            target TEXT NOT NULL,
+            user_key TEXT NOT NULL,
+            user_id INTEGER,
+            username TEXT,
+            status TEXT NOT NULL,
+            reason TEXT,
+            session_file TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(target, user_key)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS invite_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target TEXT NOT NULL,
+            user_key TEXT NOT NULL,
+            user_id INTEGER,
+            username TEXT,
+            session_file TEXT,
+            status TEXT NOT NULL,
+            reason TEXT,
+            flood_seconds INTEGER,
+            ts TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_invite_events_target_user "
+        "ON invite_events(target, user_key, id)"
+    )
+    # One-time compatibility migration from the v2.3 snapshot table.
+    old_invites = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='invites'"
+    ).fetchone()
+    if old_invites:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO invite_state(
+                target, user_key, user_id, username, status, reason,
+                session_file, attempt_count, updated_at
+            )
+            SELECT target, user_key, user_id, username, status, reason,
+                   NULL, 1, ts
+            FROM invites
+            """
+        )
     conn.execute(
         """
         INSERT INTO schema_meta(key, value) VALUES('schema_version', ?)
@@ -370,3 +422,101 @@ def exclusion_load_keys(
         scopes,
     ).fetchall()
     return {str(row[0]) for row in rows}
+
+
+def invite_state_get(
+    conn: sqlite3.Connection,
+    target: str,
+    user_key: str,
+) -> Optional[tuple[str, str]]:
+    row = conn.execute(
+        """
+        SELECT status, COALESCE(reason, '')
+        FROM invite_state
+        WHERE target=? AND user_key=?
+        LIMIT 1
+        """,
+        (target, user_key),
+    ).fetchone()
+    return (str(row[0]), str(row[1])) if row else None
+
+
+def invite_record(
+    conn: sqlite3.Connection,
+    *,
+    target: str,
+    user_key: str,
+    user_id: Optional[int],
+    username: Optional[str],
+    status: str,
+    reason: str = "",
+    session_file: Optional[str] = None,
+    flood_seconds: Optional[int] = None,
+    count_attempt: bool = True,
+) -> None:
+    """Append one immutable event and update the current invite state."""
+    now = utcnow_iso()
+    clean_username = _clean_username(username)
+    conn.execute(
+        """
+        INSERT INTO invite_events(
+            target, user_key, user_id, username, session_file,
+            status, reason, flood_seconds, ts
+        )
+        VALUES(?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            target,
+            user_key,
+            user_id,
+            clean_username,
+            session_file,
+            status,
+            reason,
+            int(flood_seconds) if flood_seconds is not None else None,
+            now,
+        ),
+    )
+    attempt_delta = 1 if count_attempt else 0
+    conn.execute(
+        """
+        INSERT INTO invite_state(
+            target, user_key, user_id, username, status, reason,
+            session_file, attempt_count, updated_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(target, user_key) DO UPDATE SET
+            user_id=COALESCE(excluded.user_id, invite_state.user_id),
+            username=COALESCE(excluded.username, invite_state.username),
+            status=excluded.status,
+            reason=excluded.reason,
+            session_file=excluded.session_file,
+            attempt_count=invite_state.attempt_count + ?,
+            updated_at=excluded.updated_at
+        """,
+        (
+            target,
+            user_key,
+            user_id,
+            clean_username,
+            status,
+            reason,
+            session_file,
+            attempt_delta,
+            now,
+            attempt_delta,
+        ),
+    )
+    conn.commit()
+
+
+def invite_event_count(
+    conn: sqlite3.Connection,
+    target: str,
+    user_key: str,
+) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM invite_events WHERE target=? AND user_key=?",
+        (target, user_key),
+    ).fetchone()
+    return int(row[0] or 0) if row else 0
