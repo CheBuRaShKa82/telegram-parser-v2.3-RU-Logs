@@ -62,9 +62,21 @@ def _from_legacy_lines(lines: List[str]) -> AppConfig:
 def save_config(config: AppConfig, path: str = CONFIG_PATH) -> None:
     payload = asdict(config)
     tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
+
+    if os.name != "nt":
+        fd = os.open(
+            tmp_path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+    else:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+
     os.replace(tmp_path, path)
     _secure_file(path)
 
