@@ -528,6 +528,22 @@ def _make_client(session_file: str, api_id: int, api_hash: str) -> TelegramClien
 # -------------------- INVITE ORCHESTRATION (PRO MODE) --------------------
 
 
+def _classify_rpc_error(exc: Exception) -> str:
+    """Classify generated Telethon RPC errors without brittle imports."""
+    name = type(exc).__name__
+    if name == "UsersTooMuchError":
+        return "target_full"
+    if name in {
+        "AuthKeyUnregisteredError",
+        "UserDeactivatedBanError",
+        "UserDeactivatedError",
+    }:
+        return "session_dead"
+    if name == "InputUserDeactivatedError":
+        return "user_deactivated"
+    return "other"
+
+
 @dataclass
 class SessionState:
     session_file: str
@@ -1356,6 +1372,26 @@ def inviting_rotate_sessions(
                         "исключаю только эту сессию из текущего запуска."
                     )
 
+                except (ChannelPrivateError, UserBannedInChannelError) as exc:
+                    ses_stats[sf]["forbidden"] += 1
+                    st.fail += 1
+                    fail_cnt += 1
+                    st.blocked_until = max(st.blocked_until, _now() + 86400)
+                    _set_session_status(
+                        st, "temporary_blocked", type(exc).__name__
+                    )
+                    ledger_put(
+                        conn, target_key, user_key, user_id, username,
+                        "forbidden", type(exc).__name__,
+                        session_file=sf,
+                    )
+                    retired_for_run.add(sf)
+                    tried_sessions.add(sf)
+                    log_warn(
+                        f"🚫 {sf}: цель недоступна для этой сессии "
+                        f"({type(exc).__name__})."
+                    )
+
                 except FloodWaitError as exc:
                     sec = max(0, int(getattr(exc, "seconds", 0) or 0))
                     ses_stats[sf]["floodwait"] += 1
@@ -1435,19 +1471,72 @@ def inviting_rotate_sessions(
                     )
 
                 except RPCError as exc:
-                    ses_stats[sf]["rpc_other"] += 1
-                    st.fail += 1
-                    fail_cnt += 1
-                    ledger_put(
-                        conn, target_key, user_key, user_id, username,
-                        "failed", type(exc).__name__,
-                        session_file=sf,
-                    )
-                    tried_sessions.add(sf)
-                    log_warn(
-                        f"⚠️ {sf}: RPC {type(exc).__name__}; "
-                        "пробую другую сессию."
-                    )
+                    rpc_kind = _classify_rpc_error(exc)
+                    rpc_name = type(exc).__name__
+
+                    if rpc_kind == "target_full":
+                        ses_stats[sf]["forbidden"] += 1
+                        ledger_put(
+                            conn, target_key, user_key, user_id, username,
+                            "skip", "target_full",
+                            session_file=sf,
+                        )
+                        skip_cnt += 1
+                        completed = True
+                        stop_all = True
+                        log_stop(
+                            f"⛔ Цель {target_key} больше не принимает "
+                            f"участников ({rpc_name}); прогон остановлен."
+                        )
+
+                    elif rpc_kind == "session_dead":
+                        ses_stats[sf]["rpc_other"] += 1
+                        st.fail += 1
+                        fail_cnt += 1
+                        st.banned = True
+                        _set_session_status(st, "unauthorized", rpc_name)
+                        retired_for_run.add(sf)
+                        tried_sessions.add(sf)
+                        drop_client(sf)
+                        ledger_put(
+                            conn, target_key, user_key, user_id, username,
+                            "failed", rpc_name,
+                            session_file=sf,
+                        )
+                        log_warn(
+                            f"🚫 {sf}: сессия больше не пригодна "
+                            f"({rpc_name}); исключена из запуска."
+                        )
+
+                    elif rpc_kind == "user_deactivated":
+                        ses_stats[sf]["invalid"] += 1
+                        ledger_put(
+                            conn, target_key, user_key, user_id, username,
+                            "invalid", "user_deactivated",
+                            session_file=sf,
+                        )
+                        excluded_add(
+                            conn, user_key, user_id, username,
+                            "user_deactivated",
+                            global_scope=True,
+                        )
+                        skip_cnt += 1
+                        completed = True
+
+                    else:
+                        ses_stats[sf]["rpc_other"] += 1
+                        st.fail += 1
+                        fail_cnt += 1
+                        ledger_put(
+                            conn, target_key, user_key, user_id, username,
+                            "failed", rpc_name,
+                            session_file=sf,
+                        )
+                        tried_sessions.add(sf)
+                        log_warn(
+                            f"⚠️ {sf}: RPC {rpc_name}; "
+                            "пробую другую сессию."
+                        )
 
                 except Exception as exc:
                     ses_stats[sf]["other"] += 1
