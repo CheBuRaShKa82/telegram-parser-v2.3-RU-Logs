@@ -20,11 +20,21 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Iterable, List, Optional, Tuple, Union, Dict, Any
 
+from storage import (
+    UserCandidate,
+    candidate_from_raw,
+    connect_db,
+    exclusion_add,
+    exclusion_has,
+    exclusion_load_keys,
+    exclusion_reason,
+    upsert_user,
+)
+
 from telethon.sync import TelegramClient
 from telethon import utils as tl_utils
 from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest, GetParticipantRequest
 from telethon.tl.types import (
-    InputPeerUser,
     UserStatusOnline,
     UserStatusRecently,
     UserStatusLastWeek,
@@ -180,22 +190,15 @@ def session_name_from_file(session_file: str) -> str:
 
 
 def list_session_files() -> List[str]:
-    """Возвращает список файлов *.session (ТОЛЬКО имена файлов) из папки sessoins."""
+    """Возвращает список файлов .session из папки sessoins/."""
     ensure_sessions_dir()
-    p = Path(SESSIONS_DIR)
-    return sorted([x.name for x in p.glob("*.session") if x.is_file()])
-
-
-def list_session_files() -> List[str]:
-    """Возвращает список файлов .session (только имена файлов, без пути)."""
-    ensure_sessions_dir()
-    out: List[str] = []
     try:
-        for p in Path(SESSIONS_DIR).glob("*.session"):
-            out.append(p.name)
-    except Exception:
-        pass
-    return sorted(out)
+        return sorted(
+            p.name for p in Path(SESSIONS_DIR).glob("*.session") if p.is_file()
+        )
+    except OSError as exc:
+        log_warn(f"Не удалось прочитать каталог сессий: {type(exc).__name__}")
+        return []
 
 # -------------------- ЛОГИ --------------------
 
@@ -342,7 +345,7 @@ def _append_unique(path: str, values: Iterable[str], prefix_at: bool = False) ->
 # -------------------- LEDGER (SQLite) --------------------
 
 def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(LEDGER_DB)
+    conn = connect_db(LEDGER_DB)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS invites (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -374,21 +377,10 @@ def _db() -> sqlite3.Connection:
             updated_at TEXT
         )
     """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS excluded_users (
-            user_key TEXT PRIMARY KEY,
-            user_id INTEGER,
-            username TEXT,
-            reason TEXT,
-            hits INTEGER DEFAULT 1,
-            first_ts TEXT,
-            last_ts TEXT
-        )
-    """)
-
     conn.commit()
     return conn
+
+def ledger_get(
 
 def ledger_get(conn: sqlite3.Connection, target: str, user_key: str) -> Optional[Tuple[str, str]]:
     cur = conn.execute(
@@ -413,42 +405,67 @@ def ledger_put(conn: sqlite3.Connection, target: str, user_key: str, user_id: Op
 
 
 
-def excluded_load_all(conn: sqlite3.Connection) -> set:
-    cur = conn.execute("SELECT user_key FROM excluded_users")
-    return {r[0] for r in cur.fetchall()}
-
-
-def excluded_has(conn: sqlite3.Connection, user_key: str) -> bool:
-    cur = conn.execute("SELECT 1 FROM excluded_users WHERE user_key=? LIMIT 1", (user_key,))
-    return cur.fetchone() is not None
-
-
-def excluded_reason(conn: sqlite3.Connection, user_key: str) -> str:
-    cur = conn.execute("SELECT reason FROM excluded_users WHERE user_key=? LIMIT 1", (user_key,))
-    row = cur.fetchone()
-    return row[0] if row and row[0] else ''
-
-
-def excluded_add(conn: sqlite3.Connection, user_key: str, user_id: Optional[int], username: Optional[str], reason: str) -> None:
-    """Добавляет пользователя в глобальный список исключённых.
-
-    Эти пользователи больше не будут браться в работу (ускоряет прогон и убирает вечные ошибки).
-    """
-    ts = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        """
-        INSERT INTO excluded_users(user_key, user_id, username, reason, hits, first_ts, last_ts)
-        VALUES(?,?,?,?,1,?,?)
-        ON CONFLICT(user_key) DO UPDATE SET
-            user_id=COALESCE(excluded.user_id, excluded_users.user_id),
-            username=COALESCE(excluded.username, excluded_users.username),
-            reason=excluded.reason,
-            hits=excluded_users.hits+1,
-            last_ts=excluded.last_ts
-        """,
-        (user_key, user_id, username, reason, ts, ts),
+def excluded_load_all(
+    conn: sqlite3.Connection,
+    target_key: Optional[str] = None,
+    session_file: Optional[str] = None,
+) -> set:
+    return exclusion_load_keys(
+        conn, target_key=target_key, session_file=session_file
     )
-    conn.commit()
+
+
+def excluded_has(
+    conn: sqlite3.Connection,
+    user_key: str,
+    target_key: Optional[str] = None,
+    session_file: Optional[str] = None,
+) -> bool:
+    return exclusion_has(
+        conn,
+        user_key,
+        target_key=target_key,
+        session_file=session_file,
+    )
+
+
+def excluded_reason(
+    conn: sqlite3.Connection,
+    user_key: str,
+    target_key: Optional[str] = None,
+    session_file: Optional[str] = None,
+) -> str:
+    return exclusion_reason(
+        conn,
+        user_key,
+        target_key=target_key,
+        session_file=session_file,
+    )
+
+
+def excluded_add(
+    conn: sqlite3.Connection,
+    user_key: str,
+    user_id: Optional[int],
+    username: Optional[str],
+    reason: str,
+    *,
+    target_key: Optional[str] = None,
+    session_file: Optional[str] = None,
+    global_scope: bool = False,
+) -> None:
+    exclusion_add(
+        conn,
+        user_key,
+        user_id=user_id,
+        username=username,
+        reason=reason,
+        target_key=target_key,
+        session_file=session_file,
+        global_scope=global_scope,
+    )
+
+def session_stats_load(
 
 def session_stats_load(conn: sqlite3.Connection, session_files: List[str]) -> Dict[str, "SessionState"]:
     """Load persisted session states from DB (blocked/frozen/banned + rolling counters).
@@ -547,45 +564,71 @@ def session_consume_invite_token(st: "SessionState", per_hour_limit: int, per_da
         st.day_count = int(getattr(st, "day_count", 0) or 0) + 1
 # -------------------- CORE OPS --------------------
 
+def _source_metadata(chat_entity: Any, source_type: str) -> Tuple[Optional[str], Optional[str], str]:
+    source_id = getattr(chat_entity, "id", None)
+    source_title = getattr(chat_entity, "title", None)
+    if source_title is None:
+        source_title = getattr(chat_entity, "username", None)
+    try:
+        if source_id is None:
+            source_id = tl_utils.get_peer_id(chat_entity)
+    except Exception:
+        pass
+    return (
+        str(source_id) if source_id is not None else None,
+        str(source_title) if source_title else None,
+        source_type,
+    )
+
+
 def parsing(client: TelegramClient, chat_entity: Union[str, int, Any], parse_id: bool, parse_name: bool) -> None:
-    """
-    Парсинг участников с ЖЁСТКИМ фильтром качества.
-    Результат пишет в:
-      - usernames.txt (с @)
-      - userids.txt
-    """
+    """Парсинг видимого списка участников с сохранением в SQLite."""
     log_info(f"🔍 Начат парсинг: {chat_entity}")
     good_usernames: List[str] = []
     good_ids: List[str] = []
-
     total = 0
     kept = 0
-    skipped = {}
+    skipped: Dict[str, int] = {}
+    conn = _db()
+    source_id, source_title, source_type = _source_metadata(chat_entity, "participants")
 
-    for user in client.iter_participants(chat_entity):
-        total += 1
-        ok, reason = quality_hard(user)
-        if not ok:
-            skipped[reason] = skipped.get(reason, 0) + 1
-            continue
+    try:
+        for user in client.iter_participants(chat_entity):
+            total += 1
+            ok, reason = quality_hard(user)
+            if not ok:
+                skipped[reason] = skipped.get(reason, 0) + 1
+                continue
 
-        kept += 1
-        if parse_name and user.username:
-            good_usernames.append(user.username)
-        if parse_id:
-            ref = id_ref_from_userobj(user)
-            if ref:
-                good_ids.append(ref)
+            kept += 1
+            upsert_user(
+                conn,
+                user,
+                source_id=source_id,
+                source_title=source_title,
+                source_type=source_type,
+            )
+            if parse_name and getattr(user, "username", None):
+                good_usernames.append(user.username)
+            if parse_id and getattr(user, "id", None) is not None:
+                good_ids.append(str(int(user.id)))
 
-    added_u = added_i = 0
-    if parse_name:
-        added_u = _append_unique("usernames.txt", good_usernames, prefix_at=True)
-    if parse_id:
-        added_i = _append_unique("userids.txt", good_ids, prefix_at=False)
+            if kept % 200 == 0:
+                conn.commit()
+        conn.commit()
+    finally:
+        conn.close()
 
-    log_ok(f"✅ Парсинг завершён. Всего: {total}, прошло фильтр: {kept}, добавлено usernames: {added_u}, ids: {added_i}")
+    added_u = _append_unique("usernames.txt", good_usernames, prefix_at=True) if parse_name else 0
+    added_i = _append_unique("userids.txt", good_ids, prefix_at=False) if parse_id else 0
+    log_ok(
+        f"✅ Парсинг завершён. Всего: {total}, прошло фильтр: {kept}, "
+        f"добавлено usernames: {added_u}, ids: {added_i}"
+    )
     if skipped:
-        parts = ", ".join([f"{k}={v}" for k, v in sorted(skipped.items(), key=lambda x: -x[1])])
+        parts = ", ".join(
+            f"{k}={v}" for k, v in sorted(skipped.items(), key=lambda x: -x[1])
+        )
         log_info(f"📉 Отфильтровано: {parts}")
 
 
@@ -597,97 +640,108 @@ def parsing_from_messages(
     limit_messages: int = 5000,
     max_age_days: int = 7,
 ) -> None:
-    """
-    Парсинг пользователей ИЗ СООБЩЕНИЙ (когда список участников скрыт).
-    Собирает авторов сообщений за последние `max_age_days` дней (или последние `limit_messages` сообщений).
-    Применяет ЖЁСТКИЙ фильтр качества и пишет в:
-      - usernames.txt (с @)
-      - userids.txt
-    """
-    log_info(f"🔍 Начат парсинг из сообщений: {chat_entity} | лимит сообщений={limit_messages} | возраст≤{max_age_days}д")
+    """Собирает активных авторов сообщений и сохраняет их в SQLite."""
+    log_info(
+        f"🔍 Начат парсинг из сообщений: {chat_entity} | "
+        f"лимит сообщений={limit_messages} | возраст≤{max_age_days}д"
+    )
     print("Старт: парсинг из сообщений… Это может занять время. Прогресс будет обновляться.", flush=True)
     good_usernames: List[str] = []
     good_ids: List[str] = []
-
     scanned = 0
     unique_found = 0
     kept = 0
     skipped: Dict[str, int] = {}
-
     seen_user_ids: set = set()
     cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    conn = _db()
+    source_id, source_title, source_type = _source_metadata(chat_entity, "messages")
 
-    for msg in client.iter_messages(chat_entity, limit=limit_messages):
-        # Периодический прогресс в консоль (чтобы не казалось, что всё зависло)
-        scanned += 1
-        if scanned % 200 == 0:
-            print(f"Просмотрено: {scanned} | уникальных авторов: {unique_found} | прошло фильтр: {kept}", end='\r', flush=True)
-        try:
-            # Отсечём слишком старые сообщения (если есть дата)
-            if getattr(msg, "date", None) is not None:
-                try:
-                    # msg.date обычно tz-aware (UTC)
-                    if msg.date < cutoff:
-                        break
-                except Exception:
-                    pass
+    try:
+        for msg in client.iter_messages(chat_entity, limit=limit_messages):
+            scanned += 1
+            if scanned % 200 == 0:
+                print(
+                    f"Просмотрено: {scanned} | уникальных авторов: {unique_found} | прошло фильтр: {kept}",
+                    end="\r",
+                    flush=True,
+                )
+            try:
+                if getattr(msg, "date", None) is not None and msg.date < cutoff:
+                    break
 
-            sid = getattr(msg, "sender_id", None)
-            if not sid:
-                continue
-            if sid in seen_user_ids:
-                continue
-            seen_user_ids.add(sid)
-            unique_found += 1
+                sid = getattr(msg, "sender_id", None)
+                if not sid or sid in seen_user_ids:
+                    continue
+                seen_user_ids.add(sid)
+                unique_found += 1
 
-            # Получаем объект пользователя
-            user = getattr(msg, "sender", None)
-            if user is None:
-                try:
-                    user = msg.get_sender()
-                except Exception:
-                    user = None
-            if user is None:
-                try:
-                    user = client.get_entity(sid)
-                except Exception:
-                    user = None
-            if user is None:
-                skipped["не удалось получить пользователя"] = skipped.get("не удалось получить пользователя", 0) + 1
-                continue
+                user = getattr(msg, "sender", None)
+                if user is None:
+                    try:
+                        user = msg.get_sender()
+                    except Exception:
+                        user = None
+                if user is None:
+                    try:
+                        user = client.get_entity(sid)
+                    except Exception:
+                        user = None
+                if user is None:
+                    skipped["не удалось получить пользователя"] = skipped.get(
+                        "не удалось получить пользователя", 0
+                    ) + 1
+                    continue
 
-            ok, reason = quality_hard(user)
-            if not ok:
-                skipped[reason] = skipped.get(reason, 0) + 1
-                continue
+                ok, reason = quality_hard(user)
+                if not ok:
+                    skipped[reason] = skipped.get(reason, 0) + 1
+                    continue
 
-            kept += 1
-            if parse_name and getattr(user, "username", None):
-                good_usernames.append(user.username)
-            if parse_id:
-                ref = id_ref_from_userobj(user)
-                if ref:
-                    good_ids.append(ref)
+                kept += 1
+                upsert_user(
+                    conn,
+                    user,
+                    source_id=source_id,
+                    source_title=source_title,
+                    source_type=source_type,
+                    seen_at=getattr(msg, "date", None).isoformat()
+                    if getattr(msg, "date", None)
+                    else None,
+                )
+                if parse_name and getattr(user, "username", None):
+                    good_usernames.append(user.username)
+                if parse_id and getattr(user, "id", None) is not None:
+                    good_ids.append(str(int(user.id)))
 
-        except Exception as e:
-            skipped["ошибка сообщения"] = skipped.get("ошибка сообщения", 0) + 1
-            log_warn(f"⚠️ Ошибка при обработке сообщения: {e}")
+                if kept % 200 == 0:
+                    conn.commit()
+            except Exception as exc:
+                skipped["ошибка сообщения"] = skipped.get("ошибка сообщения", 0) + 1
+                log_warn(f"⚠️ Ошибка при обработке сообщения: {type(exc).__name__}")
+        conn.commit()
+    finally:
+        conn.close()
 
-    added_u = added_i = 0
-    if parse_name:
-        added_u = _append_unique("usernames.txt", good_usernames, prefix_at=True)
-    if parse_id:
-        added_i = _append_unique("userids.txt", good_ids, prefix_at=False)
-
+    added_u = _append_unique("usernames.txt", good_usernames, prefix_at=True) if parse_name else 0
+    added_i = _append_unique("userids.txt", good_ids, prefix_at=False) if parse_id else 0
     log_ok(
-        f"✅ Парсинг из сообщений завершён. Сообщений просмотрено: {scanned}, уникальных авторов: {unique_found}, прошло фильтр: {kept}, "
+        f"✅ Парсинг из сообщений завершён. Сообщений просмотрено: {scanned}, "
+        f"уникальных авторов: {unique_found}, прошло фильтр: {kept}, "
         f"добавлено usernames: {added_u}, ids: {added_i}"
     )
-    print()  # перевод строки после прогресс-строки
-    print("Готово: парсинг из сообщений завершён. Итоги — в app.log и файлах usernames.txt/userids.txt", flush=True)
+    print()
+    print(
+        "Готово: парсинг из сообщений завершён. Итоги — в app.log, SQLite и экспортных TXT",
+        flush=True,
+    )
     if skipped:
-        parts = ", ".join([f"{k}={v}" for k, v in sorted(skipped.items(), key=lambda x: -x[1])])
+        parts = ", ".join(
+            f"{k}={v}" for k, v in sorted(skipped.items(), key=lambda x: -x[1])
+        )
         log_info(f"📉 Отфильтровано/пропущено: {parts}")
+
+def _target_key(
 
 def _target_key(target: Any) -> str:
     """Стабильный ключ для target в ledger."""
@@ -731,11 +785,20 @@ def target_ref(target: Any) -> Union[str, int, Any]:
     return target
 
 
+def resolve_target_for_client(client: TelegramClient, target: Any) -> Any:
+    """Resolve target with the current session; never reuse another session's InputEntity."""
+    ref = target_ref(target)
+    try:
+        return client.get_input_entity(ref)
+    except Exception:
+        return client.get_entity(ref)
+
+
 def _make_client(session_file: str, api_id: int, api_hash: str) -> TelegramClient:
     """Создаёт sync TelethonClient по .session файлу."""
     # session_file хранится как '<name>.session' (basename), а Telethon ждёт имя БЕЗ расширения.
     session_name = session_name_from_file(session_file)
-    client = TelegramClient(session_name, api_id, api_hash)
+    client = TelegramClient(session_name, api_id, api_hash, flood_sleep_threshold=0)
     client.connect()
     if not client.is_user_authorized():
         raise RuntimeError(f"Сессия не авторизована: {session_file}")
@@ -880,49 +943,33 @@ def _sleep_until_ready(states: List[SessionState], extra_jitter: Tuple[float, fl
 # -------------------- USER REF HELPERS --------------------
 
 def id_ref_from_userobj(user: Any) -> str:
-    # Returns id:access_hash if available, else id (as string).
+    """Portable user reference: only Telegram user ID, never access_hash."""
     try:
-        uid = getattr(user, 'id', None)
-        ah = getattr(user, 'access_hash', None)
-        if uid is not None and ah is not None:
-            return f"{int(uid)}:{int(ah)}"
-        if uid is not None:
-            return str(int(uid))
-    except Exception:
-        pass
-    return ""
+        uid = getattr(user, "id", None)
+        return str(int(uid)) if uid is not None else ""
+    except (TypeError, ValueError):
+        return ""
 
 
-def parse_user_ref(raw: Any) -> Tuple[str, Optional[int], Optional[str], Any]:
-    # Returns (user_key, user_id, username, entity)
-    # entity is one of: InputPeerUser(id,hash), '@username', int(id)
-    if isinstance(raw, int) or (isinstance(raw, str) and raw.strip().isdigit()):
-        uid = int(raw)
-        return f"id:{uid}", uid, None, uid
-
-    s = str(raw).strip()
-    if not s:
-        return 'empty', None, None, None
-
-    if s.startswith('@'):
-        uname = s[1:]
-        return f"u:{uname.lower()}", None, uname, '@' + uname
-
-    m = re.fullmatch(r"(\d+):(\d+)", s)
-    if m:
-        uid = int(m.group(1))
-        ah = int(m.group(2))
-        return f"id:{uid}", uid, None, InputPeerUser(uid, ah)
-
-    # plain username without @
-    if re.fullmatch(r"[A-Za-z0-9_]{4,}", s):
-        uname = s
-        return f"u:{uname.lower()}", None, uname, '@' + uname
-
-    return f"raw:{s}", None, None, s
+def parse_user_ref(raw: Any) -> Tuple[str, Optional[int], Optional[str], UserCandidate]:
+    candidate = candidate_from_raw(raw)
+    return candidate.key, candidate.user_id, candidate.username, candidate
 
 
+def resolve_user_for_client(client: TelegramClient, raw: Any) -> Any:
+    """Resolve a user independently inside the current Telegram session."""
+    candidate = candidate_from_raw(raw)
+    if candidate.username:
+        try:
+            return client.get_input_entity("@" + candidate.username)
+        except Exception:
+            pass
+    if candidate.user_id is not None:
+        # This succeeds only when this session knows the entity/access_hash.
+        return client.get_input_entity(int(candidate.user_id))
+    raise ValueError("Не удалось определить пользователя в текущей сессии")
 
+def prune_users_files(
 
 def prune_users_files(target: Union[str, int, Any], statuses: Tuple[str, ...] = ("ok","already","privacy","invalid"), include_excluded: bool = True) -> Tuple[int,int]:
     """Удаляет из usernames.txt и userids.txt тех, кто уже обработан по target (ledger) и/или в excluded_users.
@@ -1204,17 +1251,36 @@ def inviting_rotate_sessions(
         # jitter before action
         time.sleep(delay + random.uniform(float(jitter_min), float(jitter_max)))
 
-        # resolve target in this session
+        # Resolve both target and user independently in the selected session.
         try:
-            target_entity = client.get_entity(target)
-        except Exception:
-            target_entity = target
+            target_entity = resolve_target_for_client(client, target)
+            invitee_entity = resolve_user_for_client(client, entity)
+        except ValueError:
+            ledger_put(conn, target_key, user_key, user_id, username, "failed", "cannot_resolve_in_session")
+            st.fail += 1
+            fail_cnt += 1
+            log_warn(f"⏭️ {sf}: не удалось резолвить пользователя {user_key} в этой сессии")
+            try:
+                session_stats_save(conn, st)
+            except Exception:
+                pass
+            continue
+        except Exception as exc:
+            st.fail += 1
+            fail_cnt += 1
+            st.blocked_until = max(st.blocked_until, _now() + 60)
+            log_warn(f"🌐 {sf}: не удалось резолвить цель/пользователя ({type(exc).__name__})")
+            try:
+                session_stats_save(conn, st)
+            except Exception:
+                pass
+            continue
 
         try:
             st.attempts += 1
             attempts_in_session[sf] = attempts_in_session.get(sf, 0) + 1
 
-            client(InviteToChannelRequest(channel=target_entity, users=[entity]))
+            client(InviteToChannelRequest(channel=target_entity, users=[invitee_entity]))
 
             ledger_put(conn, target_key, user_key, user_id, username, "ok", f"session={sf}")
             # consume rolling limits
@@ -1448,11 +1514,7 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
 
     delay = max(1.0, float(base_delay))
 
-    # resolve target once (по возможности)
-    try:
-        target_entity = client.get_entity(target)
-    except Exception:
-        target_entity = target
+    target_entity = resolve_target_for_client(client, target)
 
     for raw in users:
         user_key, user_id, username, entity = parse_user_ref(raw)
@@ -1469,7 +1531,8 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
         time.sleep(delay + random.uniform(0.3, 1.2))
 
         try:
-            client(InviteToChannelRequest(channel=target_entity, users=[entity]))
+            invitee_entity = resolve_user_for_client(client, entity)
+            client(InviteToChannelRequest(channel=target_entity, users=[invitee_entity]))
             ledger_put(conn, target_key, user_key, user_id, username, "ok", "ok")
             ok_cnt += 1
             log_ok(f"✅ Инвайт отправлен: {('@'+username) if username else user_key} → {target_key}")
@@ -1614,19 +1677,15 @@ def _create_account_session(api_id: int, api_hash: str) -> None:
 
     # ВАЖНО: session = path/name (БЕЗ .session). Telethon создаст sessoins/<phone>.session
     session_name = session_name_from_file(f"{phone}.session")
-    client = TelegramClient(
-        session_name,
-        api_id,
-        api_hash,
-        device_model="iPhone 13 Pro",
-        system_version="14.0",
-        app_version="10.0",
-        lang_code="en",
-        system_lang_code="en-US",
-    )
+    client = TelegramClient(session_name, api_id, api_hash, flood_sleep_threshold=0)
     print("Сейчас придёт код в Telegram. Введите код и (если спросит) пароль 2FA.")
     client.start(phone=phone)
     client.disconnect()
+    if os.name != "nt":
+        try:
+            os.chmod(session_name + ".session", 0o600)
+        except OSError:
+            pass
 
     log_ok(f"📲 Аккаунт добавлен: {phone}.session (папка {SESSIONS_DIR}/)")
     print("Готово. Сессия создана.")
@@ -1641,7 +1700,13 @@ def config() -> None:
 
         print("=== НАСТРОЙКИ ===")
         print(f"1 - Обновить api_id   [{options[0].strip()}]")
-        print(f"2 - Обновить api_hash [{options[1].strip()}]")
+        _hash = options[1].strip()
+        _masked_hash = (
+            (_hash[:4] + "****" + _hash[-4:])
+            if _hash not in ("", "NONEHASH") and len(_hash) > 8
+            else ("****" if _hash not in ("", "NONEHASH") else _hash)
+        )
+        print(f"2 - Обновить api_hash [{_masked_hash}]")
         print(f"3 - Парсить user-id   [{options[2].strip()}]")
         print(f"4 - Парсить user-name [{options[3].strip()}]")
         print(f"5 - Добавить аккаунт  [{len(sessions)}]")
