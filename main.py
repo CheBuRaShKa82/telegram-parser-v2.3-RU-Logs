@@ -19,10 +19,8 @@ from telethon.sync import TelegramClient
 
 from config_ui import config, getoptions
 from inviter import (
-    inviting,
     inviting_rotate_sessions,
     preflight_sessions_for_target,
-    prune_users_files,
     target_ref,
 )
 from parser import (
@@ -452,143 +450,169 @@ def do_inviting() -> None:
         time.sleep(2)
         return
 
-    raw_delay = input("Базовая задержка между попытками (сек), по умолчанию 2.0: ").strip()
+    # Selector client is no longer used for the actual invite run.
+    client.disconnect()
+
+    raw_delay = input(
+        "Базовая задержка между попытками (сек), по умолчанию 5.0: "
+    ).strip()
     try:
-        base_delay = float(raw_delay) if raw_delay else 2.0
-    except Exception:
-        base_delay = 2.0
+        base_delay = float(raw_delay) if raw_delay else 5.0
+    except ValueError:
+        base_delay = 5.0
 
+    if len(sess_list) > 1:
+        re_raw = input(
+            "Плановая смена сессии каждые N успешных инвайтов "
+            "(0 = только по состоянию), по умолчанию 0: "
+        ).strip()
+        try:
+            rotate_every = int(re_raw) if re_raw else 0
+        except ValueError:
+            rotate_every = 0
+    else:
+        rotate_every = 0
+
+    ma_raw = input(
+        "Максимум попыток одной сессии за запуск "
+        "(0 = без лимита), по умолчанию 20: "
+    ).strip()
     try:
-        if len(sess_list) == 1:
-            inviting(client, target_entity, users, base_delay=base_delay)
-            if yn("Очистить usernames.txt / userids.txt от уже обработанных (ускорить следующий прогон)? (y/n): "):
-                removed, kept = prune_users_files(target)
-                print(f"Очищено записей: {removed}. Осталось: {kept}. Бэкап: *.bak-...")
-                input("Нажми Enter...")
-        else:
-            # закрываем первый клиент, дальше будут открываться по мере ротации
-            client.disconnect()
+        max_attempts = int(ma_raw) if ma_raw else 20
+    except ValueError:
+        max_attempts = 20
 
-            re_raw = input(
-                "Плановая смена сессии каждые N успешных инвайтов (0 = только по флуду), по умолчанию 0: "
-            ).strip()
-            ma_raw = input("Максимум попыток одной сессии ЗА ЭТОТ ЗАПУСК (0 = без лимита), по умолчанию 0: ").strip()
+    nm = yn("Ночной режим (пауза ночью)? (y/n): ")
+    night_start = (2, 0)
+    night_end = (7, 0)
+    if nm:
+        ns = input("Окно ночи START HH:MM (по умолчанию 02:00): ").strip()
+        ne = input("Окно ночи END   HH:MM (по умолчанию 07:00): ").strip()
+
+        def _parse_hm(value, default):
+            if not value:
+                return default
             try:
-                rotate_every = int(re_raw) if re_raw else 0
-            except Exception:
-                rotate_every = 0
-            try:
-                max_attempts = int(ma_raw) if ma_raw else 0
-            except Exception:
-                max_attempts = 0
+                hour, minute = value.split(":", 1)
+                hour = int(hour)
+                minute = int(minute)
+                if 0 <= hour <= 23 and 0 <= minute <= 59:
+                    return (hour, minute)
+            except (TypeError, ValueError):
+                pass
+            return default
 
+        night_start = _parse_hm(ns, (2, 0))
+        night_end = _parse_hm(ne, (7, 0))
 
-            nm = yn("Ночной режим (пауза ночью)? (y/n): ")
-            night_start = (2, 0)
-            night_end = (7, 0)
-            if nm:
-                ns = input("Окно ночи START HH:MM (по умолчанию 02:00): ").strip()
-                ne = input("Окно ночи END   HH:MM (по умолчанию 07:00): ").strip()
-                def _parse_hm(v, d):
-                    if not v:
-                        return d
-                    try:
-                        h,m = v.split(":",1)
-                        h=int(h); m=int(m)
-                        if 0<=h<=23 and 0<=m<=59:
-                            return (h,m)
-                    except Exception:
-                        pass
-                    return d
-                night_start = _parse_hm(ns, (2,0))
-                night_end = _parse_hm(ne, (7,0))
+    default_user_attempts = 1 if len(sess_list) == 1 else min(3, len(sess_list))
+    ua_raw = input(
+        "Лимит попыток на одного пользователя "
+        f"(default {default_user_attempts}): "
+    ).strip()
+    try:
+        max_user_attempts = (
+            int(ua_raw) if ua_raw else default_user_attempts
+        )
+    except ValueError:
+        max_user_attempts = default_user_attempts
 
-            ua_raw = input("Лимит попыток на одного юзера (0 = по одной на каждую доступную сессию, по умолчанию 3): ").strip()
-            try:
-                max_user_attempts = int(ua_raw) if ua_raw else 3
-            except Exception:
-                max_user_attempts = 3
+    pf_raw = input(
+        "Заморозка сессии при PeerFlood (часы, по умолчанию 24): "
+    ).strip()
+    try:
+        peerflood_hours = int(pf_raw) if pf_raw else 24
+    except ValueError:
+        peerflood_hours = 24
 
-            pf_raw = input("Заморозка сессии при PeerFlood (часы, по умолчанию 24): ").strip()
-            try:
-                peerflood_hours = int(pf_raw) if pf_raw else 24
-            except Exception:
-                peerflood_hours = 24
+    j_raw = input(
+        "Джиттер min-max сек, по умолчанию 0.5-1.5: "
+    ).strip()
+    jitter_min, jitter_max = 0.5, 1.5
+    if j_raw:
+        try:
+            left, right = j_raw.split("-", 1)
+            jitter_min = float(left.strip())
+            jitter_max = float(right.strip())
+        except (TypeError, ValueError):
+            jitter_min, jitter_max = 0.5, 1.5
 
-            j_raw = input("Джиттер (случайная прибавка) min-max сек, по умолчанию 0.3-1.2: ").strip()
-            jitter_min, jitter_max = 0.3, 1.2
-            if j_raw:
-                try:
-                    a,b = j_raw.split("-",1)
-                    jitter_min = float(a.strip())
-                    jitter_max = float(b.strip())
-                except Exception:
-                    jitter_min, jitter_max = 0.3, 1.2
+    ph_raw = input(
+        "Лимит успешных инвайтов на сессию В ЧАС "
+        "(0 = выключить), по умолчанию 10: "
+    ).strip()
+    pd_raw = input(
+        "Лимит успешных инвайтов на сессию В СУТКИ "
+        "(0 = выключить), по умолчанию 30: "
+    ).strip()
+    try:
+        per_hour = int(ph_raw) if ph_raw else 10
+    except ValueError:
+        per_hour = 10
+    try:
+        per_day = int(pd_raw) if pd_raw else 30
+    except ValueError:
+        per_day = 30
 
-            ph_raw = input("Лимит инвайтов на сессию В ЧАС (0 = выключено), по умолчанию 0: ").strip()
-            pd_raw = input("Лимит инвайтов на сессию В СУТКИ (0 = выключено), по умолчанию 0: ").strip()
-            try:
-                per_hour = int(ph_raw) if ph_raw else 0
-            except Exception:
-                per_hour = 0
-            try:
-                per_day = int(pd_raw) if pd_raw else 0
-            except Exception:
-                per_day = 0
+    if (per_hour == 0 or per_day == 0) and not yn(
+        "Один из лимитов отключён. Подтвердить отключение? (y/n): "
+    ):
+        per_hour = per_hour or 10
+        per_day = per_day or 30
 
+    if yn(
+        "Сделать preflight (проверка сессий + авто-вступление в цель)? (y/n): "
+    ):
+        rep = preflight_sessions_for_target(
+            api_id=api_id,
+            api_hash=api_hash,
+            session_files=sess_list,
+            target=target,
+            auto_join=True,
+            block_cannot_join_hours=24,
+        )
+        ok_list = list(rep.get("ok", [])) + list(rep.get("joined", []))
+        print("\n=== PRE-FLIGHT REPORT ===")
+        print(f"OK (уже в цели): {len(rep.get('ok', []))}")
+        print(f"JOINED (вступил): {len(rep.get('joined', []))}")
+        print(f"NOT AUTH: {len(rep.get('not_authorized', []))}")
+        print(f"CANNOT JOIN: {len(rep.get('cannot_join', []))}")
+        print(f"NO RIGHTS: {len(rep.get('no_rights', []))}")
+        print(f"FLOOD WAIT: {len(rep.get('flood_wait', []))}")
+        print(f"NETWORK: {len(rep.get('network', []))}")
+        print(f"UNKNOWN: {len(rep.get('unknown', []))}")
+        if not ok_list:
+            print("Нет подходящих сессий после preflight. Останавливаю.")
+            input("Нажми Enter...")
+            return
+        sess_list = ok_list
+        input("Нажми Enter, чтобы продолжить...")
 
-            if yn("Сделать PRO-preflight (проверка сессий + авто-вступление в цель)? (y/n): "):
-                rep = preflight_sessions_for_target(
-                    api_id=api_id,
-                    api_hash=api_hash,
-                    session_files=sess_list,
-                    target=target,
-                    auto_join=True,
-                    block_cannot_join_hours=24,
-                )
-                ok_list = list(rep.get('ok', [])) + list(rep.get('joined', []))
-                print("\n=== PRE-FLIGHT REPORT ===")
-                print(f"OK (уже в цели): {len(rep.get('ok', []))}")
-                print(f"JOINED (вступил): {len(rep.get('joined', []))}")
-                print(f"NOT AUTH (не авториз): {len(rep.get('not_authorized', []))}")
-                print(f"CANNOT JOIN (нет доступа/приват): {len(rep.get('cannot_join', []))}")
-                print(f"NO RIGHTS (нет прав/ограничен): {len(rep.get('no_rights', []))}")
-                print(f"FLOOD WAIT (пауза): {len(rep.get('flood_wait', []))}")
-                print(f"NETWORK (сеть): {len(rep.get('network', []))}")
-                print(f"UNKNOWN: {len(rep.get('unknown', []))}")
-                if not ok_list:
-                    print("Нет подходящих сессий после preflight. Останавливаю.")
-                    input("Нажми Enter...")
-                    return
-                sess_list = ok_list
-                input("Это не зависание 🙂 Тут пауза после отчета. Нажми Enter чтобы продолжить...")
+    inviting_rotate_sessions(
+        api_id=api_id,
+        api_hash=api_hash,
+        session_files=sess_list,
+        target=target,
+        users=users,
+        base_delay=base_delay,
+        rotate_every=rotate_every,
+        max_attempts_per_session=max_attempts,
+        jitter_min=jitter_min,
+        jitter_max=jitter_max,
+        max_user_attempts=max_user_attempts,
+        peerflood_freeze_hours=peerflood_hours,
+        night_mode=nm,
+        night_start=night_start,
+        night_end=night_end,
+        per_hour_limit=per_hour,
+        per_day_limit=per_day,
+    )
 
-            inviting_rotate_sessions(
-                api_id=api_id,
-                api_hash=api_hash,
-                session_files=sess_list,
-                target=target,
-                users=users,
-                base_delay=base_delay,
-                rotate_every=rotate_every,
-                max_attempts_per_session=max_attempts,
-                jitter_min=jitter_min,
-                jitter_max=jitter_max,
-                max_user_attempts=max_user_attempts,
-                peerflood_freeze_hours=peerflood_hours,
-                night_mode=nm,
-                night_start=night_start,
-                night_end=night_end,
-                per_hour_limit=per_hour,
-                per_day_limit=per_day,
-            )
+    print(
+        "Готово. Основная очередь и статусы находятся в SQLite; "
+        "TXT-файлы — только legacy/export."
+    )
 
-            # Опциональная очистка базы: убираем уже обработанных из файлов
-            if yn("Очистить usernames.txt / userids.txt от уже обработанных (ускорить следующий прогон)? (y/n): "):
-                removed, kept = prune_users_files(target)
-                print(f"Очищено записей: {removed}. Осталось: {kept}. Бэкап: *.bak-...")
-                input("Нажми Enter...")
-        print("Готово. Смотри invite_ledger.db и app.log")
     finally:
         try:
             client.disconnect()
