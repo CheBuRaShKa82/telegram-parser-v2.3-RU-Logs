@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-telegram-parser-v2.3 (main)
+telegram-parser v2.4 (main)
 Парсер + инвайтер. Жёсткий фильтр качества. RU-логи.
 
 Файлы:
