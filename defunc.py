@@ -380,8 +380,6 @@ def _db() -> sqlite3.Connection:
     conn.commit()
     return conn
 
-def ledger_get(
-
 def ledger_get(conn: sqlite3.Connection, target: str, user_key: str) -> Optional[Tuple[str, str]]:
     cur = conn.execute(
         "SELECT status, reason FROM invites WHERE target=? AND user_key=? LIMIT 1",
@@ -464,8 +462,6 @@ def excluded_add(
         session_file=session_file,
         global_scope=global_scope,
     )
-
-def session_stats_load(
 
 def session_stats_load(conn: sqlite3.Connection, session_files: List[str]) -> Dict[str, "SessionState"]:
     """Load persisted session states from DB (blocked/frozen/banned + rolling counters).
@@ -1104,9 +1100,6 @@ def inviting_rotate_sessions(
     conn = _db()
     target_key = _target_key(target)
 
-    # global exclude cache (пользователи с вечными ошибками / уже исключённые)
-    excluded_cache = excluded_load_all(conn)
-
     delay = max(1.0, float(base_delay))
 
     # session states (persisted)
@@ -1194,15 +1187,11 @@ def inviting_rotate_sessions(
         # normalize user
         user_key, user_id, username, entity = parse_user_ref(raw)
 
-        # global exclude (вечные отказы/неинвайтабельные)
-        if user_key in excluded_cache:
+        # Check only exclusions applicable to this target (plus global).
+        if excluded_has(conn, user_key, target_key=target_key):
             skip_cnt += 1
-            # дополнительно фиксируем в ledger как skip, чтобы было видно в БД
-            try:
-                rsn = excluded_reason(conn, user_key)
-            except Exception:
-                rsn = 'excluded'
-            ledger_put(conn, target_key, user_key, user_id, username, 'skip', f'excluded:{rsn}')
+            rsn = excluded_reason(conn, user_key, target_key=target_key) or "excluded"
+            ledger_put(conn, target_key, user_key, user_id, username, "skip", f"excluded:{rsn}")
             continue
 
 
@@ -1243,6 +1232,14 @@ def inviting_rotate_sessions(
             break
 
         sf = st.session_file
+        if excluded_has(conn, user_key, target_key=target_key, session_file=sf):
+            skip_cnt += 1
+            rsn = excluded_reason(
+                conn, user_key, target_key=target_key, session_file=sf
+            ) or "excluded"
+            ledger_put(conn, target_key, user_key, user_id, username, "skip", f"excluded:{rsn}")
+            continue
+
         client = get_client(sf)
         if client is None:
             # сессия помечена как невалидная в get_client; пробуем следующую
@@ -1310,8 +1307,7 @@ def inviting_rotate_sessions(
         except UserPrivacyRestrictedError:
             ledger_put(conn, target_key, user_key, user_id, username, "privacy", "закрыты инвайты")
             try:
-                excluded_add(conn, user_key, user_id, username, "privacy")
-                excluded_cache.add(user_key)
+                excluded_add(conn, user_key, user_id, username, "privacy", target_key=target_key, session_file=sf)
             except Exception:
                 pass
             skip_cnt += 1
@@ -1321,8 +1317,7 @@ def inviting_rotate_sessions(
         except UserNotMutualContactError:
             ledger_put(conn, target_key, user_key, user_id, username, "skip", "not_mutual_contact")
             try:
-                excluded_add(conn, user_key, user_id, username, "not_mutual_contact")
-                excluded_cache.add(user_key)
+                excluded_add(conn, user_key, user_id, username, "not_mutual_contact", target_key=target_key, session_file=sf)
             except Exception:
                 pass
             skip_cnt += 1
@@ -1332,8 +1327,10 @@ def inviting_rotate_sessions(
         except UserChannelsTooMuchError:
             ledger_put(conn, target_key, user_key, user_id, username, "skip", "user_channels_too_much")
             try:
-                excluded_add(conn, user_key, user_id, username, "user_channels_too_much")
-                excluded_cache.add(user_key)
+                excluded_add(
+                    conn, user_key, user_id, username, "user_channels_too_much",
+                    target_key=target_key
+                )
             except Exception:
                 pass
             skip_cnt += 1
@@ -1343,8 +1340,10 @@ def inviting_rotate_sessions(
         except UserKickedError:
             ledger_put(conn, target_key, user_key, user_id, username, "skip", "user_kicked")
             try:
-                excluded_add(conn, user_key, user_id, username, "user_kicked")
-                excluded_cache.add(user_key)
+                excluded_add(
+                    conn, user_key, user_id, username, "user_kicked",
+                    target_key=target_key
+                )
             except Exception:
                 pass
             skip_cnt += 1
@@ -1354,8 +1353,7 @@ def inviting_rotate_sessions(
         except UserBlockedError:
             ledger_put(conn, target_key, user_key, user_id, username, "skip", "user_blocked")
             try:
-                excluded_add(conn, user_key, user_id, username, "user_blocked")
-                excluded_cache.add(user_key)
+                excluded_add(conn, user_key, user_id, username, "user_blocked", target_key=target_key, session_file=sf)
             except Exception:
                 pass
             skip_cnt += 1
@@ -1365,18 +1363,6 @@ def inviting_rotate_sessions(
         except ChatWriteForbiddenError as e:
             # Обычно означает ограничение/запрет на стороне ИМЕННО этой сессии в цели.
             diag = _diagnose_invite_context(client, target_entity)
-            try:
-                if isinstance(diag, dict) and (diag.get('participant_error') == 'UserNotParticipantError' or diag.get('perm_error') == 'UserNotParticipantError'):
-                    excluded_add(conn, user_key, user_id, username, 'user_not_participant')
-                    excluded_cache.add(user_key)
-            except Exception:
-                pass
-            try:
-                if str(diag.get('participant_error') or '') == 'UserNotParticipantError':
-                    excluded_add(conn, user_key, user_id, username, 'user_not_participant')
-                    excluded_cache.add(user_key)
-            except Exception:
-                pass
             ledger_put(conn, target_key, user_key, user_id, username, "forbidden", f"{type(e).__name__}")
             st.fail += 1
             fail_cnt += 1
@@ -1409,8 +1395,10 @@ def inviting_rotate_sessions(
         except (UsernameInvalidError, UserIdInvalidError):
             ledger_put(conn, target_key, user_key, user_id, username, "invalid", "некорректный пользователь")
             try:
-                excluded_add(conn, user_key, user_id, username, "invalid_user")
-                excluded_cache.add(user_key)
+                excluded_add(
+                    conn, user_key, user_id, username, "invalid_user",
+                    global_scope=True
+                )
             except Exception:
                 pass
             skip_cnt += 1
@@ -1431,15 +1419,9 @@ def inviting_rotate_sessions(
             st.frozen_until = max(st.frozen_until, _now() + freeze_sec)
             log_stop(f"⛔ PeerFlood на {sf}: замораживаю на {peerflood_freeze_hours}ч и продолжаю другой сессией.")
         except ValueError:
-            # Обычно это значит: по одному user_id не хватает access_hash (Telethon не может резолвить)
-            ledger_put(conn, target_key, user_key, user_id, username, "skip", "нет access_hash / не могу резолвить по id")
-            try:
-                excluded_add(conn, user_key, user_id, username, "no_access_hash")
-                excluded_cache.add(user_key)
-            except Exception:
-                pass
-            skip_cnt += 1
-            log_warn(f"⏭️ Пропуск: не могу инвайтить {raw} (нужен @username или id:access_hash).")
+            ledger_put(conn, target_key, user_key, user_id, username, "failed", "cannot_resolve_in_session")
+            fail_cnt += 1
+            log_warn(f"⏭️ Не удалось резолвить {user_key} в текущей сессии.")
 
         except (ConnectionResetError, ConnectionError, OSError) as e:
             # Сетевой сбой/ресет соединения — не вина пользователя.
@@ -1505,8 +1487,6 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
     """
     conn = _db()
     target_key = _target_key(target)
-    excluded_cache = excluded_load_all(conn)
-
     log_info(f"🚀 Старт инвайта в: {target_key}. Кандидатов: {len(users)}")
     ok_cnt = 0
     skip_cnt = 0
@@ -1519,7 +1499,7 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
     for raw in users:
         user_key, user_id, username, entity = parse_user_ref(raw)
 
-        if user_key in excluded_cache:
+        if excluded_has(conn, user_key, target_key=target_key):
             skip_cnt += 1
             continue
 
@@ -1546,8 +1526,10 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
         except UserPrivacyRestrictedError:
             ledger_put(conn, target_key, user_key, user_id, username, "privacy", "закрыты инвайты")
             try:
-                excluded_add(conn, user_key, user_id, username, "privacy")
-                excluded_cache.add(user_key)
+                excluded_add(
+                    conn, user_key, user_id, username, "privacy",
+                    target_key=target_key, session_file=sf
+                )
             except Exception:
                 pass
             skip_cnt += 1
@@ -1556,8 +1538,10 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
         except UserNotMutualContactError:
             ledger_put(conn, target_key, user_key, user_id, username, "skip", "not_mutual_contact")
             try:
-                excluded_add(conn, user_key, user_id, username, "not_mutual_contact")
-                excluded_cache.add(user_key)
+                excluded_add(
+                    conn, user_key, user_id, username, "not_mutual_contact",
+                    target_key=target_key, session_file=sf
+                )
             except Exception:
                 pass
             skip_cnt += 1
@@ -1566,8 +1550,10 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
         except UserChannelsTooMuchError:
             ledger_put(conn, target_key, user_key, user_id, username, "skip", "user_channels_too_much")
             try:
-                excluded_add(conn, user_key, user_id, username, "user_channels_too_much")
-                excluded_cache.add(user_key)
+                excluded_add(
+                    conn, user_key, user_id, username, "user_channels_too_much",
+                    target_key=target_key
+                )
             except Exception:
                 pass
             skip_cnt += 1
@@ -1576,8 +1562,10 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
         except UserKickedError:
             ledger_put(conn, target_key, user_key, user_id, username, "skip", "user_kicked")
             try:
-                excluded_add(conn, user_key, user_id, username, "user_kicked")
-                excluded_cache.add(user_key)
+                excluded_add(
+                    conn, user_key, user_id, username, "user_kicked",
+                    target_key=target_key
+                )
             except Exception:
                 pass
             skip_cnt += 1
@@ -1586,8 +1574,10 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
         except UserBlockedError:
             ledger_put(conn, target_key, user_key, user_id, username, "skip", "user_blocked")
             try:
-                excluded_add(conn, user_key, user_id, username, "user_blocked")
-                excluded_cache.add(user_key)
+                excluded_add(
+                    conn, user_key, user_id, username, "user_blocked",
+                    target_key=target_key, session_file=sf
+                )
             except Exception:
                 pass
             skip_cnt += 1
@@ -1595,12 +1585,6 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
 
         except ChatWriteForbiddenError as e:
             diag = _diagnose_invite_context(client, target_entity)
-            try:
-                if isinstance(diag, dict) and (diag.get('participant_error') == 'UserNotParticipantError' or diag.get('perm_error') == 'UserNotParticipantError'):
-                    excluded_add(conn, user_key, user_id, username, 'user_not_participant')
-                    excluded_cache.add(user_key)
-            except Exception:
-                pass
             ledger_put(conn, target_key, user_key, user_id, username, "forbidden", f"{type(e).__name__}")
             fail_cnt += 1
             log_warn(f"🚫 ChatWriteForbidden при инвайте {('@'+username) if username else user_key} → {target_key}. Диагностика: {diag}")
@@ -1616,8 +1600,10 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
         except (UsernameInvalidError, UserIdInvalidError):
             ledger_put(conn, target_key, user_key, user_id, username, "invalid", "некорректный пользователь")
             try:
-                excluded_add(conn, user_key, user_id, username, "invalid_user")
-                excluded_cache.add(user_key)
+                excluded_add(
+                    conn, user_key, user_id, username, "invalid_user",
+                    global_scope=True
+                )
             except Exception:
                 pass
             skip_cnt += 1
