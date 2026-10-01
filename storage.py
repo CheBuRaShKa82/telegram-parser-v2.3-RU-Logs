@@ -16,7 +16,7 @@ from typing import Any, Iterable, List, Optional
 
 
 DB_PATH = "invite_ledger.db"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -136,6 +136,21 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_invite_events_target_user "
         "ON invite_events(target, user_key, id)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS parser_checkpoints (
+            checkpoint_key TEXT PRIMARY KEY,
+            source_id TEXT,
+            source_title TEXT,
+            mode TEXT NOT NULL,
+            cursor_int INTEGER,
+            processed INTEGER NOT NULL DEFAULT 0,
+            saved INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'running',
+            updated_at TEXT NOT NULL
+        )
+        """
     )
     # One-time compatibility migration from the v2.3 snapshot table.
     old_invites = conn.execute(
@@ -520,3 +535,115 @@ def invite_event_count(
         (target, user_key),
     ).fetchone()
     return int(row[0] or 0) if row else 0
+
+
+
+@dataclass(frozen=True)
+class ParserCheckpoint:
+    checkpoint_key: str
+    source_id: Optional[str]
+    source_title: Optional[str]
+    mode: str
+    cursor_int: Optional[int]
+    processed: int
+    saved: int
+    status: str
+    updated_at: str
+
+
+def checkpoint_get(
+    conn: sqlite3.Connection,
+    checkpoint_key: str,
+) -> Optional[ParserCheckpoint]:
+    row = conn.execute(
+        """
+        SELECT checkpoint_key, source_id, source_title, mode, cursor_int,
+               processed, saved, status, updated_at
+        FROM parser_checkpoints
+        WHERE checkpoint_key=?
+        LIMIT 1
+        """,
+        (checkpoint_key,),
+    ).fetchone()
+    if not row:
+        return None
+    return ParserCheckpoint(
+        checkpoint_key=str(row[0]),
+        source_id=str(row[1]) if row[1] is not None else None,
+        source_title=str(row[2]) if row[2] is not None else None,
+        mode=str(row[3]),
+        cursor_int=int(row[4]) if row[4] is not None else None,
+        processed=int(row[5] or 0),
+        saved=int(row[6] or 0),
+        status=str(row[7] or "running"),
+        updated_at=str(row[8]),
+    )
+
+
+def checkpoint_put(
+    conn: sqlite3.Connection,
+    *,
+    checkpoint_key: str,
+    mode: str,
+    source_id: Optional[str],
+    source_title: Optional[str],
+    cursor_int: Optional[int],
+    processed: int,
+    saved: int,
+    status: str = "running",
+) -> None:
+    now = utcnow_iso()
+    conn.execute(
+        """
+        INSERT INTO parser_checkpoints(
+            checkpoint_key, source_id, source_title, mode, cursor_int,
+            processed, saved, status, updated_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(checkpoint_key) DO UPDATE SET
+            source_id=excluded.source_id,
+            source_title=excluded.source_title,
+            mode=excluded.mode,
+            cursor_int=excluded.cursor_int,
+            processed=excluded.processed,
+            saved=excluded.saved,
+            status=excluded.status,
+            updated_at=excluded.updated_at
+        """,
+        (
+            checkpoint_key,
+            source_id,
+            source_title,
+            mode,
+            cursor_int,
+            int(processed),
+            int(saved),
+            status,
+            now,
+        ),
+    )
+    conn.commit()
+
+
+def checkpoint_clear(conn: sqlite3.Connection, checkpoint_key: str) -> None:
+    conn.execute(
+        "DELETE FROM parser_checkpoints WHERE checkpoint_key=?",
+        (checkpoint_key,),
+    )
+    conn.commit()
+
+
+def export_users_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT user_id, username, first_name, last_name,
+               source_id, source_title, source_type, parsed_at, last_seen_at
+        FROM users
+        ORDER BY last_seen_at DESC, user_id ASC
+        """
+    ).fetchall()
+    columns = (
+        "user_id", "username", "first_name", "last_name",
+        "source_id", "source_title", "source_type", "parsed_at", "last_seen_at",
+    )
+    return [dict(zip(columns, row)) for row in rows]
