@@ -12,8 +12,9 @@ telegram-parser-v2.3 (main)
 
 import os
 import time
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
+from storage import UserCandidate, candidate_from_raw, connect_db, load_user_candidates
 from telethon.sync import TelegramClient
 
 from defunc import (
@@ -162,7 +163,7 @@ def pick_sessions() -> List[str]:
 def make_client(session_file: str, api_id: int, api_hash: str) -> TelegramClient:
     # session_file хранится как '<name>.session' (basename), а сами файлы лежат в папке sessoins/
     session_name = session_name_from_file(session_file)
-    client = TelegramClient(session_name, api_id, api_hash)
+    client = TelegramClient(session_name, api_id, api_hash, flood_sleep_threshold=0)
     client.connect()
     if not client.is_user_authorized():
         print(f"Сессия не авторизована. Создай её заново в Настройках (пункт 5). Папка: {SESSIONS_DIR}/")
@@ -201,33 +202,37 @@ def do_parsing() -> None:
         time.sleep(1.5)
 
 
-def _load_users_from_files() -> List[Union[str, int]]:
-    users: List[Union[str, int]] = []
-    if os.path.exists("userids.txt"):
-        with open("userids.txt", "r", encoding="utf-8") as f:
+def _load_users_from_files() -> List[Union[UserCandidate, str, int]]:
+    """Load the canonical SQLite user queue; fall back to legacy TXT exports."""
+    conn = connect_db()
+    try:
+        candidates = load_user_candidates(conn)
+    finally:
+        conn.close()
+    if candidates:
+        return candidates
+
+    legacy: List[Union[UserCandidate, str, int]] = []
+    for path in ("userids.txt", "usernames.txt"):
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
             for line in f:
-                s = line.strip()
-                if s.isdigit():
-                    users.append(int(s))
-    if os.path.exists("usernames.txt"):
-        with open("usernames.txt", "r", encoding="utf-8") as f:
-            for line in f:
-                s = line.strip()
-                if not s:
+                raw = line.strip()
+                if not raw:
                     continue
-                if s.startswith("@"):
-                    s = s[1:]
-                if s:
-                    users.append(s)
+                candidate = candidate_from_raw(raw)
+                if candidate.key != "empty":
+                    legacy.append(candidate)
 
     seen = set()
-    uniq = []
-    for u in users:
-        k = ("id", u) if isinstance(u, int) else ("u", u.lower())
-        if k in seen:
+    uniq: List[Union[UserCandidate, str, int]] = []
+    for user in legacy:
+        candidate = candidate_from_raw(user)
+        if candidate.key in seen:
             continue
-        seen.add(k)
-        uniq.append(u)
+        seen.add(candidate.key)
+        uniq.append(candidate)
     return uniq
 
 
@@ -256,6 +261,7 @@ def do_parsing_messages() -> None:
     parse_id = yn("Парсить user ids? (y/n): ")
     if not (parse_name or parse_id):
         print("Нечего парсить — выбери хотя бы usernames или ids.")
+        client.disconnect()
         time.sleep(2)
         return
 
@@ -313,6 +319,7 @@ def do_inviting() -> None:
     users = _load_users_from_files()
     if not users:
         print("Списки пустые. Сначала сделай Парсинг.")
+        client.disconnect()
         time.sleep(2)
         return
 
