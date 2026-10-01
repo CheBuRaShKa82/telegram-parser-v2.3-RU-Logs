@@ -136,7 +136,7 @@ class ParserCheckpointTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             db = os.path.join(tmp, "parser.db")
-            with patch.object(defunc, "LEDGER_DB", db):
+            with patch.object(parser_mod, "DB_PATH", db):
                 parser_mod.parsing_from_messages(
                     client,
                     SimpleNamespace(id=777, title="Chat"),
@@ -190,7 +190,7 @@ class ParticipantCheckpointTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             db = os.path.join(tmp, "participants.db")
-            with patch.object(defunc, "LEDGER_DB", db):
+            with patch.object(parser_mod, "DB_PATH", db):
                 parser_mod.parsing(
                     BrokenParticipantsClient(),
                     SimpleNamespace(id=321, title="Group"),
@@ -243,7 +243,7 @@ class ChannelCommentsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             db = os.path.join(tmp, "comments.db")
-            with patch.object(defunc, "LEDGER_DB", db):
+            with patch.object(parser_mod, "DB_PATH", db):
                 parser_mod.parsing_channel_comments(
                     client,
                     channel,
@@ -288,7 +288,7 @@ class ExportTests(unittest.TestCase):
             conn.commit()
             conn.close()
 
-            with patch.object(defunc, "LEDGER_DB", db):
+            with patch.object(parser_mod, "DB_PATH", db):
                 paths = parser_mod.export_users(out)
 
             self.assertEqual(set(paths), {"csv", "json", "txt"})
