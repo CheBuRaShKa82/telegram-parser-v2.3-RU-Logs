@@ -222,7 +222,7 @@ def ledger_put(
         flood_seconds=flood_seconds,
         count_attempt=count_attempt,
     )
-    # Keep the v2.3 snapshot table updated for backwards compatibility.
+    # Keep the legacy snapshot table updated for backwards compatibility.
     ts = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """
@@ -576,7 +576,7 @@ def _sleep_until_ready(
 ) -> None:
     """If no session is ready now, sleep until the earliest ready moment (plus jitter).
 
-    v10.1: Writes a clear message when ALL sessions are waiting, so it doesn't look like the bot froze.
+    Writes a clear message when all sessions are waiting so the CLI does not look frozen.
     For long waits, sleeps in chunks and prints progress occasionally.
     """
     now = _now()
