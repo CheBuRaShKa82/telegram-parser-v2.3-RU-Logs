@@ -1,5 +1,17 @@
 # Техническое задание: Telegram Parser / Inviter v2.4
 
+## Статус реализации
+
+- Этап A — Security + correctness: ✅ реализован
+- Этап B — Inviter reliability: ✅ реализован
+- Этап C — Parser reliability: ✅ реализован
+- Этап D — Cleanup / architecture / config / logging / tests / README: ✅ реализован
+- GitHub Actions: ✅ Python 3.11 / 3.12 / 3.13
+- Живой smoke-тест с реальными Telegram-сессиями перед merge: ⏳ требуется отдельно
+
+CI проверяет структуру, миграции, SQLite, parser checkpoints, retry scheduler, export и unit-тесты. Реальные Telegram permissions, состояние аккаунтов и server-side ограничения можно окончательно подтвердить только на тестовых Telegram-сессиях.
+
+
 ## Цель
 
 Доработать текущий `v2.3` без переписывания проекта с нуля. Сохранить парсинг и инвайтинг, исправить найденные критические ошибки, сделать multi-account работу корректной, безопасной и восстанавливаемой после сбоев.
