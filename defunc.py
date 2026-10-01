@@ -671,33 +671,40 @@ def _source_metadata(
     chat_entity: Any,
     source_type: str,
 ) -> Tuple[Optional[str], Optional[str], str]:
+    # Primitive references must be handled before getattr(), because strings
+    # expose methods like .title() which are not Telegram metadata.
+    if isinstance(chat_entity, int):
+        raw_id = str(chat_entity)
+        return raw_id, raw_id, source_type
+
+    if isinstance(chat_entity, str):
+        raw = chat_entity.strip()
+        return (
+            raw or None,
+            raw or None,
+            source_type,
+        )
+
     source_id = getattr(chat_entity, "id", None)
     source_title = getattr(chat_entity, "title", None)
+    if not isinstance(source_title, str):
+        source_title = None
     if source_title is None:
-        source_title = getattr(chat_entity, "username", None)
+        username = getattr(chat_entity, "username", None)
+        if isinstance(username, str) and username:
+            source_title = "@" + username.lstrip("@")
+
     try:
-        if source_id is None and not isinstance(chat_entity, (str, int)):
+        if source_id is None:
             source_id = tl_utils.get_peer_id(chat_entity)
     except Exception:
         pass
-
-    # Manual @username / t.me link / numeric ID must get its own stable
-    # checkpoint instead of collapsing into "unknown".
-    if source_id is None and isinstance(chat_entity, int):
-        source_id = chat_entity
-    if source_id is None and isinstance(chat_entity, str):
-        raw = chat_entity.strip()
-        if raw:
-            source_id = raw
-            if not source_title:
-                source_title = raw
 
     return (
         str(source_id) if source_id is not None else None,
         str(source_title) if source_title else None,
         source_type,
     )
-
 
 def _parser_checkpoint_key(
     source_id: Optional[str],
