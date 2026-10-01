@@ -3,8 +3,12 @@ name: v2.4 smoke
 on:
   push:
     branches:
+      - main
       - fix/v2.4-audit
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   smoke:
@@ -13,12 +17,18 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install ruff pip-audit
+      - name: Dependency audit
+        run: python -m pip_audit -r requirements.txt
+      - name: Fatal lint
+        run: python -m ruff check . --select E9,F63,F7,F82
       - name: Compile Python sources
         run: python -m py_compile main.py defunc.py config_store.py config_ui.py logging_setup.py sessions.py storage.py parser.py inviter.py
       - name: Unit tests
