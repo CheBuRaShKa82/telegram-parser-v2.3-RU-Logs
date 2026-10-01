@@ -148,47 +148,8 @@ LEDGER_DB = "invite_ledger.db"
 # -------------------- LEDGER (SQLite) --------------------
 
 def _db() -> sqlite3.Connection:
-    conn = connect_db(LEDGER_DB)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS invites (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            target TEXT NOT NULL,
-            user_key TEXT NOT NULL,
-            user_id INTEGER,
-            username TEXT,
-            status TEXT NOT NULL,
-            reason TEXT,
-            ts TEXT NOT NULL
-        )
-    """)
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_inv_unique ON invites(target, user_key)")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS session_stats (
-            session_file TEXT PRIMARY KEY,
-            blocked_until REAL DEFAULT 0,
-            frozen_until REAL DEFAULT 0,
-            banned INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'active',
-            status_reason TEXT DEFAULT '',
-            ok INTEGER DEFAULT 0,
-            fail INTEGER DEFAULT 0,
-            attempts INTEGER DEFAULT 0,
-            last_invite_at REAL DEFAULT 0,
-            next_invite_at REAL DEFAULT 0,
-            hour_window_start REAL DEFAULT 0,
-            hour_count INTEGER DEFAULT 0,
-            day_window_start REAL DEFAULT 0,
-            day_count INTEGER DEFAULT 0,
-            updated_at TEXT
-        )
-    """)
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(session_stats)").fetchall()}
-    if "status" not in cols:
-        conn.execute("ALTER TABLE session_stats ADD COLUMN status TEXT DEFAULT 'active'")
-    if "status_reason" not in cols:
-        conn.execute("ALTER TABLE session_stats ADD COLUMN status_reason TEXT DEFAULT ''")
-    conn.commit()
-    return conn
+    """Open the canonical storage schema for inviter operations."""
+    return connect_db(LEDGER_DB)
 
 def ledger_get(
     conn: sqlite3.Connection,
@@ -222,6 +183,7 @@ def ledger_put(
         session_file=session_file,
         flood_seconds=flood_seconds,
         count_attempt=count_attempt,
+        commit=False,
     )
     # Keep the legacy snapshot table updated for backwards compatibility.
     ts = datetime.now(timezone.utc).isoformat()
