@@ -2,12 +2,16 @@ import os
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
+
+from telethon.tl.types import PeerChannel
 
 import inviter
 from storage import (
     UserCandidate,
     connect_db,
+    exclusion_add,
     invite_event_count,
     invite_record,
     invite_state_get,
@@ -51,6 +55,22 @@ class InviteStorageTests(unittest.TestCase):
             ).fetchone()[0]
             self.assertEqual(attempts, 2)
             conn.close()
+
+
+class TargetKeyTests(unittest.TestCase):
+    def test_entity_and_portable_ref_share_same_key(self):
+        entity = PeerChannel(123456)
+        portable = inviter.target_ref(entity)
+        self.assertEqual(
+            inviter.canonical_target_key(entity),
+            inviter.canonical_target_key(portable),
+        )
+
+    def test_public_username_is_case_insensitive(self):
+        self.assertEqual(
+            inviter.canonical_target_key("@ExampleName"),
+            inviter.canonical_target_key("https://t.me/examplename"),
+        )
 
 
 class SessionSchedulerTests(unittest.TestCase):
@@ -111,8 +131,9 @@ class SessionSchedulerTests(unittest.TestCase):
 
 class RetryIntegrationTests(unittest.TestCase):
     class FakeClient:
-        def __init__(self, fail_network=False):
+        def __init__(self, fail_network=False, missing=False):
             self.fail_network = fail_network
+            self.missing = missing
             self.calls = 0
             self.disconnected = False
 
@@ -120,7 +141,9 @@ class RetryIntegrationTests(unittest.TestCase):
             self.calls += 1
             if self.fail_network:
                 raise ConnectionError("simulated")
-            return object()
+            if self.missing:
+                return SimpleNamespace(missing_invitees=[object()])
+            return SimpleNamespace(missing_invitees=[])
 
         def disconnect(self):
             self.disconnected = True
@@ -177,6 +200,90 @@ class RetryIntegrationTests(unittest.TestCase):
                 ).fetchall()
             ]
             self.assertEqual(event_sessions, ["a.session", "b.session"])
+            conn.close()
+
+
+class ExclusionLoopRegressionTests(unittest.TestCase):
+    def test_all_session_scoped_exclusions_finish_without_hot_loop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "excluded.db")
+            target = inviter.canonical_target_key("@Target")
+            conn = connect_db(db)
+            for session_file in ("a.session", "b.session"):
+                exclusion_add(
+                    conn,
+                    "id:42",
+                    user_id=42,
+                    username="tester",
+                    reason="not_mutual_contact",
+                    target_key=target,
+                    session_file=session_file,
+                )
+            conn.close()
+
+            with (
+                patch.object(inviter, "LEDGER_DB", db),
+                patch.object(
+                    inviter,
+                    "_make_client",
+                    side_effect=AssertionError(
+                        "excluded sessions must not be opened"
+                    ),
+                ),
+                patch.object(inviter.time, "sleep", return_value=None),
+            ):
+                inviter.inviting_rotate_sessions(
+                    api_id=1,
+                    api_hash="hash",
+                    session_files=["a.session", "b.session"],
+                    target="@target",
+                    users=[UserCandidate(42, "tester")],
+                    max_user_attempts=3,
+                )
+
+            conn = connect_db(db)
+            self.assertEqual(
+                invite_state_get(conn, target, "id:42"),
+                ("skip", "excluded_all_sessions"),
+            )
+            conn.close()
+
+
+class InviteOutcomeTests(unittest.TestCase):
+    def test_missing_invitee_is_not_recorded_as_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "missing.db")
+            client = RetryIntegrationTests.FakeClient(missing=True)
+
+            with (
+                patch.object(inviter, "LEDGER_DB", db),
+                patch.object(inviter, "_make_client", return_value=client),
+                patch.object(
+                    inviter, "resolve_target_for_client", return_value=object()
+                ),
+                patch.object(
+                    inviter, "resolve_user_for_client", return_value=object()
+                ),
+                patch.object(inviter.time, "sleep", return_value=None),
+            ):
+                inviter.inviting_rotate_sessions(
+                    api_id=1,
+                    api_hash="hash",
+                    session_files=["a.session"],
+                    target="@Target",
+                    users=[UserCandidate(42, "tester")],
+                    max_user_attempts=1,
+                    max_attempts_per_session=1,
+                    jitter_min=0.0,
+                    jitter_max=0.0,
+                )
+
+            target = inviter.canonical_target_key("@target")
+            conn = connect_db(db)
+            self.assertEqual(
+                invite_state_get(conn, target, "id:42"),
+                ("skip", "missing_invitee"),
+            )
             conn.close()
 
 
