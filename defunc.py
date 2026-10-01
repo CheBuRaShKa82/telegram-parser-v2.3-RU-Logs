@@ -1550,7 +1550,7 @@ def inviting_rotate_sessions(
                     )
                     excluded_add(
                         conn, user_key, user_id, username, "privacy",
-                        target_key=target_key, session_file=sf,
+                        target_key=target_key,
                     )
                     skip_cnt += 1
                     completed = True
