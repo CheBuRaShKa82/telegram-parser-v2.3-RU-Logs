@@ -16,13 +16,20 @@ import random
 import re
 import csv
 import json
-import logging
 import sqlite3
 from dataclasses import dataclass
-from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Iterable, List, Optional, Tuple, Union, Dict, Any
 
+from config_store import AppConfig, legacy_options, load_config, save_legacy_options
+from logging_setup import LOG_FILE, log_info, log_ok, log_pause, log_stop, log_warn
+from sessions import (
+    SESSIONS_DIR,
+    ensure_sessions_dir,
+    list_session_files,
+    secure_session_file,
+    session_name_from_file,
+)
 from storage import (
     UserCandidate,
     candidate_from_raw,
@@ -166,123 +173,22 @@ def _diagnose_invite_context(client: TelegramClient, target_entity: Any) -> Dict
     return out
 
 
-LOG_FILE = "app.log"
 LEDGER_DB = "invite_ledger.db"
 
-# -------------------- SESSIONS DIR --------------------
+# -------------------- COMPAT CONFIG WRAPPERS --------------------
 
-# Пользователь просил хранить все .session в отдельной папке.
-# ВАЖНО: Telethon принимает "имя сессии" без расширения и сам добавляет .session.
-# Поэтому мы используем путь вида: sessoins/<name>
+DEFAULT_OPTIONS = legacy_options(AppConfig())
 
-SESSIONS_DIR = "sessoins"  # намеренно как в сообщении пользователя
-
-
-def ensure_sessions_dir() -> str:
-    """Создаёт папку для сессий и возвращает её путь."""
-    Path(SESSIONS_DIR).mkdir(parents=True, exist_ok=True)
-    if os.name != "nt":
-        try:
-            os.chmod(SESSIONS_DIR, 0o700)
-        except OSError:
-            pass
-    # Мягкая миграция: если старые .session лежат рядом со скриптом — перенесём их в sessoins/
-    try:
-        for sf in Path(".").glob("*.session"):
-            if not sf.is_file():
-                continue
-            dst = Path(SESSIONS_DIR) / sf.name
-            if dst.exists():
-                continue
-            sf.rename(dst)
-        if os.name != "nt":
-            for session_path in Path(SESSIONS_DIR).glob("*.session"):
-                try:
-                    os.chmod(session_path, 0o600)
-                except OSError:
-                    pass
-    except Exception:
-        pass
-    return SESSIONS_DIR
-
-
-def session_name_from_file(session_file: str) -> str:
-    """Преобразует '<name>.session' -> 'sessoins/<name>' (путь для Telethon)."""
-    ensure_sessions_dir()
-    base = os.path.basename(session_file)
-    name = base[:-8] if base.endswith(".session") else base
-    return os.path.join(SESSIONS_DIR, name)
-
-
-def list_session_files() -> List[str]:
-    """Возвращает список файлов .session из папки sessoins/."""
-    ensure_sessions_dir()
-    try:
-        return sorted(
-            p.name for p in Path(SESSIONS_DIR).glob("*.session") if p.is_file()
-        )
-    except OSError as exc:
-        log_warn(f"Не удалось прочитать каталог сессий: {type(exc).__name__}")
-        return []
-
-# -------------------- ЛОГИ --------------------
-
-def _setup_logging() -> None:
-    logging.basicConfig(
-        filename=LOG_FILE,
-        level=logging.INFO,
-        format="%(asctime)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-_setup_logging()
-
-def log_info(msg: str) -> None:
-    logging.info(f"ИНФО | {msg}")
-
-def log_ok(msg: str) -> None:
-    logging.info(f"УСПЕХ | {msg}")
-
-def log_warn(msg: str) -> None:
-    logging.info(f"ВНИМАНИЕ | {msg}")
-
-def log_pause(msg: str) -> None:
-    logging.info(f"ПАУЗА | {msg}")
-
-def log_stop(msg: str) -> None:
-    logging.info(f"СТОП | {msg}")
-
-# -------------------- OPTIONS --------------------
-
-DEFAULT_OPTIONS = [
-    "NONEID\n",
-    "NONEHASH\n",
-    "True\n",   # parse user-id
-    "True\n",   # parse user-name
-]
 
 def ensure_options() -> None:
-    if not os.path.exists("options.txt"):
-        with open("options.txt", "w", encoding="utf-8") as f:
-            f.writelines(DEFAULT_OPTIONS)
-        if os.name != "nt":
-            try:
-                os.chmod("options.txt", 0o600)
-            except OSError:
-                pass
-        return
+    """Compatibility wrapper: canonical config is config.json."""
+    load_config()
 
-    # если файл пустой — тоже восстановим
-    with open("options.txt", "r+", encoding="utf-8") as f:
-        lines = f.readlines()
-        if not lines:
-            f.seek(0)
-            f.writelines(DEFAULT_OPTIONS)
 
 def getoptions() -> List[str]:
-    ensure_options()
-    with open("options.txt", "r", encoding="utf-8") as f:
-        return f.readlines()
+    """Compatibility view used by the existing CLI."""
+    return legacy_options()
+
 
 # -------------------- PARSER FILTERS --------------------
 
@@ -2480,11 +2386,7 @@ def _create_account_session(api_id: int, api_hash: str) -> None:
     print("Сейчас придёт код в Telegram. Введите код и (если спросит) пароль 2FA.")
     client.start(phone=phone)
     client.disconnect()
-    if os.name != "nt":
-        try:
-            os.chmod(session_name + ".session", 0o600)
-        except OSError:
-            pass
+    secure_session_file(session_name)
 
     log_ok(f"📲 Аккаунт добавлен: {alias}.session (папка {SESSIONS_DIR}/)")
     print("Готово. Сессия создана.")
@@ -2548,14 +2450,8 @@ def config() -> None:
             time.sleep(1.0)
             continue
 
-        # сохраняем изменения настроек
-        with open("options.txt", "w", encoding="utf-8") as f:
-            f.writelines(options)
-        if os.name != "nt":
-            try:
-                os.chmod("options.txt", 0o600)
-            except OSError:
-                pass
+        # config.json is canonical; options.txt is only migrated once.
+        save_legacy_options(options)
 
         # небольшая пауза, чтобы меню не "мигало"
         time.sleep(0.2)
