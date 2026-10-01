@@ -152,6 +152,47 @@ class ParserCheckpointTests(unittest.TestCase):
             conn.close()
 
 
+class ParticipantCheckpointTests(unittest.TestCase):
+    def test_partial_participant_failure_keeps_saved_users(self):
+        user = SimpleNamespace(
+            id=777,
+            username=None,
+            first_name="Partial",
+            last_name="User",
+            photo=None,
+            bot=False,
+            deleted=False,
+            scam=False,
+            fake=False,
+            status=None,
+        )
+
+        class BrokenParticipantsClient:
+            def iter_participants(self, entity):
+                yield user
+                raise ConnectionError("simulated participant failure")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "participants.db")
+            with patch.object(defunc, "LEDGER_DB", db):
+                defunc.parsing(
+                    BrokenParticipantsClient(),
+                    SimpleNamespace(id=321, title="Group"),
+                    parse_id=False,
+                    parse_name=False,
+                    checkpoint_batch=1,
+                )
+
+            conn = connect_db(db)
+            rows = export_users_rows(conn)
+            self.assertEqual([row["user_id"] for row in rows], [777])
+            cp = checkpoint_get(conn, "participants:321")
+            self.assertIsNotNone(cp)
+            self.assertTrue(cp.status.startswith("error:"))
+            self.assertEqual(cp.saved, 1)
+            conn.close()
+
+
 class ChannelCommentsTests(unittest.TestCase):
     def test_channel_comments_save_comment_authors(self):
         channel = SimpleNamespace(
