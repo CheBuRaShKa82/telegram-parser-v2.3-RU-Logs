@@ -1086,7 +1086,23 @@ def inviting_rotate_sessions(
                     tried_sessions.clear()
                     candidates = eligible_for_user
 
-                st = _pick_best_session(
+                preferred_session = getattr(
+                    entity, "preferred_session", None
+                )
+                preferred = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if candidate.session_file == preferred_session
+                        and max(
+                            candidate.blocked_until,
+                            candidate.frozen_until,
+                            candidate.next_invite_at,
+                        ) <= _now()
+                    ),
+                    None,
+                )
+                st = preferred or _pick_best_session(
                     candidates,
                     excluded=retired_for_run,
                 )
