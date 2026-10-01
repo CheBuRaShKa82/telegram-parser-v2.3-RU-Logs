@@ -18,6 +18,7 @@ import csv
 import json
 import logging
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Iterable, List, Optional, Tuple, Union, Dict, Any
@@ -908,8 +909,6 @@ def _make_client(session_file: str, api_id: int, api_hash: str) -> TelegramClien
 
 
 # -------------------- INVITE ORCHESTRATION (PRO MODE) --------------------
-
-from dataclasses import dataclass
 
 
 @dataclass
