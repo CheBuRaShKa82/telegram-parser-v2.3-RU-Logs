@@ -93,6 +93,14 @@ class StorageRegressionTests(unittest.TestCase):
                 source_title="Source A",
                 source_type="participants",
             )
+            # Same user also appears in a different source/type combination.
+            upsert_user(
+                conn,
+                self._user(10, "a"),
+                source_id="B",
+                source_title="Source B",
+                source_type="messages",
+            )
             upsert_user(
                 conn,
                 self._user(20, "b"),
@@ -105,12 +113,39 @@ class StorageRegressionTests(unittest.TestCase):
             only_a = load_user_candidates(conn, source_id="A")
             self.assertEqual([candidate.user_id for candidate in only_a], [10])
 
+            impossible_pair = load_user_candidates(
+                conn,
+                source_id="A",
+                source_type="messages",
+            )
+            self.assertEqual(impossible_pair, [])
+
             sources = list_user_sources(conn)
             self.assertEqual(
                 {source["source_id"] for source in sources},
                 {"A", "B"},
             )
             conn.close()
+
+
+class LimitRegressionTests(unittest.TestCase):
+    def test_negative_limits_are_treated_as_disabled(self):
+        st = inviter.SessionState(
+            session_file="a.session",
+            hour_window_start=1,
+            hour_count=99,
+            day_window_start=1,
+            day_count=99,
+        )
+        self.assertEqual(
+            inviter.session_next_time_due_to_limits(st, -1, -5),
+            0,
+        )
+        before_hour = st.hour_count
+        before_day = st.day_count
+        inviter.session_consume_invite_token(st, -1, -5)
+        self.assertEqual(st.hour_count, before_hour)
+        self.assertEqual(st.day_count, before_day)
 
 
 class RpcClassificationTests(unittest.TestCase):
