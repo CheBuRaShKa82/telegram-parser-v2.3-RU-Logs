@@ -73,11 +73,13 @@ def _client_session_file(client: TelegramClient) -> Optional[str]:
 
 
 def _resolve_source_entity(client: TelegramClient, source: Any) -> Any:
-    """Normalize manual refs and dialog entities to the same Telegram entity."""
+    """Normalize manual refs while never hiding Telegram FloodWait."""
     if isinstance(source, (str, int)):
         try:
             return client.get_entity(source)
-        except Exception:
+        except FloodWaitError:
+            raise
+        except (ValueError, TypeError):
             return source
     return source
 
@@ -479,18 +481,19 @@ def parsing_from_messages(
                 if sid:
                     sid = int(sid)
                     if sid not in seen_user_ids:
-                        seen_user_ids.add(sid)
-                        unique_found += 1
-
                         user = getattr(msg, "sender", None)
                         if user is None:
                             try:
                                 user = msg.get_sender()
+                            except FloodWaitError:
+                                raise
                             except Exception:
                                 user = None
                         if user is None:
                             try:
                                 user = client.get_entity(sid)
+                            except FloodWaitError:
+                                raise
                             except Exception:
                                 user = None
 
@@ -499,6 +502,8 @@ def parsing_from_messages(
                                 skipped.get("не удалось получить пользователя", 0) + 1
                             )
                         else:
+                            seen_user_ids.add(sid)
+                            unique_found += 1
                             ok, reason = quality_user(user, filters)
                             if not ok:
                                 skipped[reason] = skipped.get(reason, 0) + 1
@@ -686,16 +691,19 @@ def parsing_channel_comments(
                         if sid:
                             sid = int(sid)
                             if sid not in seen_user_ids:
-                                seen_user_ids.add(sid)
                                 user = getattr(reply, "sender", None)
                                 if user is None:
                                     try:
                                         user = reply.get_sender()
+                                    except FloodWaitError:
+                                        raise
                                     except Exception:
                                         user = None
                                 if user is None:
                                     try:
                                         user = client.get_entity(sid)
+                                    except FloodWaitError:
+                                        raise
                                     except Exception:
                                         user = None
 
@@ -706,6 +714,7 @@ def parsing_channel_comments(
                                         ) + 1
                                     )
                                 else:
+                                    seen_user_ids.add(sid)
                                     ok, reason = quality_user(user, filters)
                                     if not ok:
                                         skipped[reason] = skipped.get(reason, 0) + 1
