@@ -104,6 +104,25 @@ class ResolveFloodWaitTests(unittest.TestCase):
             with self.assertRaises(self.FakeFloodWait):
                 inviter.resolve_target_for_client(Client(), "@target")
 
+    def test_missing_username_is_not_looked_up_twice(self):
+        calls = []
+
+        class Client:
+            def get_input_entity(self, value):
+                calls.append(("input", value))
+                raise ValueError("missing")
+
+            def get_entity(self, value):
+                calls.append(("entity", value))
+                raise AssertionError("duplicate network lookup")
+
+        with self.assertRaises(ValueError):
+            inviter.resolve_user_for_client(
+                Client(),
+                UserCandidate(None, "missing_user"),
+            )
+        self.assertEqual(calls, [("input", "@missing_user")])
+
 
 class TargetKeyTests(unittest.TestCase):
     def test_entity_and_portable_ref_share_same_key(self):
@@ -140,6 +159,24 @@ class TargetKeyTests(unittest.TestCase):
         self.assertEqual(a, "invite:aaaa1111")
         self.assertEqual(b, "invite:bbbb2222")
         self.assertNotEqual(a, b)
+
+    def test_service_links_are_not_treated_as_service_usernames(self):
+        self.assertEqual(
+            inviter.canonical_target_key("https://t.me/s/ExampleChannel"),
+            "@examplechannel",
+        )
+        for path in (
+            "addlist/AAAA",
+            "share/url?url=https://example.com",
+            "proxy?server=1.2.3.4&port=443",
+            "socks?server=1.2.3.4&port=1080",
+        ):
+            key = inviter.canonical_target_key("https://t.me/" + path)
+            self.assertTrue(key.startswith("ref:"))
+            self.assertNotIn(
+                key,
+                {"@addlist", "@share", "@proxy", "@socks"},
+            )
 
 
 class SessionSchedulerTests(unittest.TestCase):
@@ -269,6 +306,78 @@ class RetryIntegrationTests(unittest.TestCase):
                 ).fetchall()
             ]
             self.assertEqual(event_sessions, ["a.session", "b.session"])
+            conn.close()
+
+
+class NetworkReconnectTests(unittest.TestCase):
+    class Client:
+        def __init__(self, fail_request=False):
+            self.fail_request = fail_request
+            self.disconnected = False
+
+        def __call__(self, request):
+            if self.fail_request:
+                raise ConnectionError("temporary network failure")
+            return SimpleNamespace(missing_invitees=[])
+
+        def disconnect(self):
+            self.disconnected = True
+
+    def test_single_session_reconnects_after_one_network_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "network-retry.db")
+            clients = [
+                self.Client(fail_request=True),
+                self.Client(fail_request=False),
+            ]
+
+            def make_client(session_file, api_id, api_hash):
+                return clients.pop(0)
+
+            def wake(states, **kwargs):
+                for state in states:
+                    state.blocked_until = 0
+
+            with (
+                patch.object(inviter, "LEDGER_DB", db),
+                patch.object(inviter, "_make_client", side_effect=make_client),
+                patch.object(
+                    inviter, "resolve_target_for_client", return_value=object()
+                ),
+                patch.object(
+                    inviter, "resolve_user_for_client", return_value=object()
+                ),
+                patch.object(inviter, "_sleep_until_ready", side_effect=wake),
+                patch.object(inviter.time, "sleep", return_value=None),
+            ):
+                inviter.inviting_rotate_sessions(
+                    api_id=1,
+                    api_hash="hash",
+                    session_files=["a.session"],
+                    target="@target",
+                    users=[UserCandidate(42, "tester")],
+                    max_user_attempts=1,
+                    max_attempts_per_session=1,
+                    network_retry_limit=3,
+                    network_retry_base_seconds=1,
+                    jitter_min=0.0,
+                    jitter_max=0.0,
+                )
+
+            conn = connect_db(db)
+            self.assertEqual(
+                invite_state_get(conn, "@target", "id:42"),
+                ("ok", "invited"),
+            )
+            statuses = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT status FROM invite_events "
+                    "WHERE target='@target' AND user_key='id:42' "
+                    "ORDER BY id"
+                ).fetchall()
+            ]
+            self.assertEqual(statuses, ["failed", "ok"])
             conn.close()
 
 
