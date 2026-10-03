@@ -525,8 +525,8 @@ class ExportTests(unittest.TestCase):
             upsert_user(
                 conn,
                 user,
-                source_id="1",
-                source_title="Source",
+                source_id="-1000000000123",
+                source_title="@Source",
                 source_type="participants",
             )
             conn.commit()
@@ -552,6 +552,8 @@ class ExportTests(unittest.TestCase):
                 csv_row = next(csv.DictReader(handle))
             self.assertEqual(csv_row["first_name"], "'=2+2")
             self.assertEqual(csv_row["last_name"], "'@formula")
+            self.assertEqual(csv_row["source_title"], "'@Source")
+            self.assertEqual(csv_row["source_id"], "-1000000000123")
 
             if os.name != "nt":
                 for path in paths.values():
