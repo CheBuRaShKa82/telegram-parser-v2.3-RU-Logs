@@ -343,18 +343,22 @@ def session_stats_save(conn: sqlite3.Connection, st: "SessionState") -> None:
 
 
 def session_next_time_due_to_limits(st: "SessionState", per_hour_limit: int, per_day_limit: int) -> float:
-    """If limits are exceeded, returns the earliest timestamp when session can invite again (else 0)."""
+    """Return the next allowed time; negative limits are treated as disabled."""
+    per_hour_limit = max(0, int(per_hour_limit or 0))
+    per_day_limit = max(0, int(per_day_limit or 0))
     now = _now()
     next_due = 0.0
-    if per_hour_limit and getattr(st, "hour_count", 0) >= int(per_hour_limit):
+    if per_hour_limit and getattr(st, "hour_count", 0) >= per_hour_limit:
         next_due = max(next_due, float(getattr(st, "hour_window_start", now)) + 3600)
-    if per_day_limit and getattr(st, "day_count", 0) >= int(per_day_limit):
+    if per_day_limit and getattr(st, "day_count", 0) >= per_day_limit:
         next_due = max(next_due, float(getattr(st, "day_window_start", now)) + 86400)
     return next_due
 
 
 def session_consume_invite_token(st: "SessionState", per_hour_limit: int, per_day_limit: int) -> None:
-    """Consumes one invite slot for rolling hour/day windows."""
+    """Consume one rolling invite slot; negative limits are disabled."""
+    per_hour_limit = max(0, int(per_hour_limit or 0))
+    per_day_limit = max(0, int(per_day_limit or 0))
     now = _now()
     if getattr(st, "hour_window_start", 0) <= 0 or now - st.hour_window_start >= 3600:
         st.hour_window_start = now
@@ -914,6 +918,9 @@ def inviting_rotate_sessions(
     target_key = _target_key(target)
     delay = max(1.0, float(base_delay))
     user_limit = max(1, int(max_user_attempts or len(session_files) or 1))
+    max_attempts_per_session = max(0, int(max_attempts_per_session or 0))
+    per_hour_limit = max(0, int(per_hour_limit or 0))
+    per_day_limit = max(0, int(per_day_limit or 0))
 
     st_map = session_stats_load(conn, session_files)
     states = [st_map[sf] for sf in session_files]
@@ -988,8 +995,23 @@ def inviting_rotate_sessions(
             st.attempts += 1
             st.blocked_until = max(st.blocked_until, _now() + 60)
             _set_session_status(st, "temporary_blocked", type(exc).__name__)
+            retired_for_run.add(sf)
             persist(st)
-            log_warn(f"🌐 {sf}: ошибка подключения {type(exc).__name__}.")
+            log_warn(
+                f"🌐 {sf}: ошибка подключения {type(exc).__name__}; "
+                "сессия исключена до следующего запуска."
+            )
+            return None
+        except Exception as exc:
+            st.fail += 1
+            st.attempts += 1
+            _set_session_status(st, "temporary_blocked", type(exc).__name__)
+            retired_for_run.add(sf)
+            persist(st)
+            log_warn(
+                f"⚠️ {sf}: ошибка открытия сессии {type(exc).__name__}; "
+                "сессия исключена из текущего запуска."
+            )
             return None
 
     def drop_client(sf: str) -> None:
@@ -1574,9 +1596,10 @@ def inviting_rotate_sessions(
                     )
                     drop_client(sf)
                     tried_sessions.add(sf)
+                    retired_for_run.add(sf)
                     log_warn(
                         f"🌐 {sf}: {type(exc).__name__}; "
-                        "пауза 60с, пробую другую сессию."
+                        "сессия исключена до следующего запуска."
                     )
 
                 except RPCError as exc:
