@@ -4,12 +4,34 @@
 from __future__ import annotations
 
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
 LOG_FILE = "app.log"
 LOGGER_NAME = "telegram_parser"
+
+
+class SecureRotatingFileHandler(RotatingFileHandler):
+    """Rotating log handler that creates every POSIX log file as 0600."""
+
+    def _open(self):
+        if os.name == "nt":
+            return super()._open()
+
+        flags = os.O_WRONLY | os.O_CREAT
+        if "a" in self.mode:
+            flags |= os.O_APPEND
+        else:
+            flags |= os.O_TRUNC
+        fd = os.open(self.baseFilename, flags, 0o600)
+        return os.fdopen(
+            fd,
+            self.mode,
+            encoding=self.encoding,
+            errors=self.errors,
+        )
 
 
 def setup_logging(
@@ -30,7 +52,7 @@ def setup_logging(
             except Exception:
                 continue
 
-    handler = RotatingFileHandler(
+    handler = SecureRotatingFileHandler(
         log_file,
         maxBytes=max(1024, int(max_bytes)),
         backupCount=max(1, int(backup_count)),
