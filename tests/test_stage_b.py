@@ -123,7 +123,7 @@ class TargetKeyTests(unittest.TestCase):
     def test_private_post_links_do_not_collapse_to_at_c(self):
         self.assertEqual(
             inviter.canonical_target_key("https://t.me/c/123/45"),
-            "peer:-100123",
+            inviter.canonical_target_key(PeerChannel(123)),
         )
         self.assertNotEqual(
             inviter.canonical_target_key("https://t.me/c/123/45"),
