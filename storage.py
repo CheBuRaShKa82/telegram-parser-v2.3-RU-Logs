@@ -9,6 +9,7 @@ portable user identifiers because they are session-specific.
 from __future__ import annotations
 
 import os
+import secrets
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,7 +17,7 @@ from typing import Any, Iterable, List, Optional
 
 
 DB_PATH = "invite_ledger.db"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -223,6 +224,39 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    previous_version_row = conn.execute(
+        "SELECT value FROM schema_meta WHERE key='schema_version'"
+    ).fetchone()
+    try:
+        previous_version = (
+            int(previous_version_row[0])
+            if previous_version_row is not None
+            else 0
+        )
+    except (TypeError, ValueError):
+        previous_version = 0
+
+    if previous_version < 7:
+        # v7 switched parser entity source IDs from ambiguous raw .id values
+        # to Telethon marked peer IDs. The old positive-numeric checkpoint
+        # cannot be mapped safely to Chat vs Channel without live entity data,
+        # so reset only those resume cursors. Parsed users/history are kept.
+        conn.execute(
+            """
+            DELETE FROM parser_checkpoints
+            WHERE source_id GLOB '[0-9]*'
+              AND source_id NOT GLOB '*[^0-9]*'
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO schema_meta(key, value)
+            VALUES('key_format_v7_migrated', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (utcnow_iso(),),
+        )
+
     # Import the legacy invite snapshot exactly once.
     legacy_imported = conn.execute(
         "SELECT value FROM schema_meta "
@@ -277,6 +311,30 @@ def connect_db(path: str = DB_PATH) -> sqlite3.Connection:
         except OSError:
             pass
     return conn
+
+
+def get_or_create_log_hmac_key(conn: sqlite3.Connection) -> bytes:
+    """Return a per-database random key used only for pseudonymous log labels."""
+    row = conn.execute(
+        "SELECT value FROM schema_meta WHERE key='log_hmac_key'"
+    ).fetchone()
+    if row and row[0]:
+        try:
+            return bytes.fromhex(str(row[0]))
+        except ValueError:
+            pass
+
+    key = secrets.token_bytes(32)
+    conn.execute(
+        """
+        INSERT INTO schema_meta(key, value)
+        VALUES('log_hmac_key', ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (key.hex(),),
+    )
+    conn.commit()
+    return key
 
 
 def _clean_username(username: Optional[str]) -> Optional[str]:
