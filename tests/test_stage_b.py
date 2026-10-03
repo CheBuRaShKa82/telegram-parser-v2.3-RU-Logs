@@ -57,6 +57,53 @@ class InviteStorageTests(unittest.TestCase):
             conn.close()
 
 
+class ResolveFloodWaitTests(unittest.TestCase):
+    class FakeFloodWait(Exception):
+        def __init__(self, seconds=90):
+            super().__init__(f"FloodWait {seconds}")
+            self.seconds = seconds
+
+    def test_user_resolve_prefers_id_cache_before_username(self):
+        calls = []
+
+        class Client:
+            def get_input_entity(self, value):
+                calls.append(value)
+                if value == 42:
+                    return "cached-user"
+                raise AssertionError("username lookup must not be needed")
+
+        with patch.object(inviter, "FloodWaitError", self.FakeFloodWait):
+            result = inviter.resolve_user_for_client(
+                Client(),
+                UserCandidate(42, "tester"),
+            )
+
+        self.assertEqual(result, "cached-user")
+        self.assertEqual(calls, [42])
+
+    def test_user_resolve_propagates_floodwait(self):
+        class Client:
+            def get_input_entity(self, value):
+                raise ResolveFloodWaitTests.FakeFloodWait(91)
+
+        with patch.object(inviter, "FloodWaitError", self.FakeFloodWait):
+            with self.assertRaises(self.FakeFloodWait):
+                inviter.resolve_user_for_client(
+                    Client(),
+                    UserCandidate(42, "tester"),
+                )
+
+    def test_target_resolve_propagates_floodwait(self):
+        class Client:
+            def get_input_entity(self, value):
+                raise ResolveFloodWaitTests.FakeFloodWait(92)
+
+        with patch.object(inviter, "FloodWaitError", self.FakeFloodWait):
+            with self.assertRaises(self.FakeFloodWait):
+                inviter.resolve_target_for_client(Client(), "@target")
+
+
 class TargetKeyTests(unittest.TestCase):
     def test_entity_and_portable_ref_share_same_key(self):
         entity = PeerChannel(123456)
@@ -200,6 +247,66 @@ class RetryIntegrationTests(unittest.TestCase):
                 ).fetchall()
             ]
             self.assertEqual(event_sessions, ["a.session", "b.session"])
+            conn.close()
+
+
+class ResolveFloodWaitIntegrationTests(unittest.TestCase):
+    class FakeFloodWait(Exception):
+        def __init__(self, seconds=75):
+            super().__init__(f"FloodWait {seconds}")
+            self.seconds = seconds
+
+    class Client:
+        def __init__(self):
+            self.disconnected = False
+
+        def get_input_entity(self, value):
+            if value == "@target":
+                return object()
+            if value == 42:
+                raise ResolveFloodWaitIntegrationTests.FakeFloodWait(75)
+            raise ValueError(value)
+
+        def disconnect(self):
+            self.disconnected = True
+
+    def test_resolve_floodwait_blocks_session_and_records_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "resolve-flood.db")
+            client = self.Client()
+
+            with (
+                patch.object(inviter, "LEDGER_DB", db),
+                patch.object(inviter, "FloodWaitError", self.FakeFloodWait),
+                patch.object(inviter, "_make_client", return_value=client),
+                patch.object(inviter.time, "sleep", return_value=None),
+            ):
+                inviter.inviting_rotate_sessions(
+                    api_id=1,
+                    api_hash="hash",
+                    session_files=["a.session"],
+                    target="@target",
+                    users=[UserCandidate(42, "tester")],
+                    max_user_attempts=1,
+                    max_attempts_per_session=1,
+                    jitter_min=0.0,
+                    jitter_max=0.0,
+                )
+
+            conn = connect_db(db)
+            row = conn.execute(
+                "SELECT status, reason, flood_seconds "
+                "FROM invite_events WHERE user_key='id:42' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertEqual(row, ("floodwait", "resolve:75", 75))
+
+            state = conn.execute(
+                "SELECT blocked_until, status FROM session_stats "
+                "WHERE session_file='a.session'"
+            ).fetchone()
+            self.assertGreater(state[0], time.time())
+            self.assertEqual(state[1], "flood_wait")
             conn.close()
 
 
