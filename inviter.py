@@ -369,35 +369,66 @@ def session_consume_invite_token(st: "SessionState", per_hour_limit: int, per_da
 # -------------------- CORE OPS --------------------
 
 def canonical_target_key(target: Any) -> str:
-    """Return one canonical ledger key for entity/ref/username forms."""
+    """Return a collision-resistant ledger key for common Telegram refs."""
     if isinstance(target, str):
         raw = target.strip()
         if not raw:
             return "ref:"
+
         if raw.startswith("@"):
             return "@" + raw[1:].lower()
 
-        # Public t.me/username and telegram.me/username links.
+        # Private post link: t.me/c/<internal_channel_id>/<message_id>
+        match = re.match(
+            r"^(?:https?://)?(?:t\.me|telegram\.me)/c/(\d+)(?:/\d+)?/?$",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return f"peer:-100{int(match.group(1))}"
+
+        # Invite links are unique references, not usernames.
+        match = re.match(
+            r"^(?:https?://)?(?:t\.me|telegram\.me)/(?:joinchat/|\+)([^/?#]+)",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return "invite:" + match.group(1).lower()
+
+        # Public username links.
         match = re.match(
             r"^(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]+)(?:/.*)?$",
             raw,
             flags=re.IGNORECASE,
         )
         if match:
-            return "@" + match.group(1).lower()
+            name = match.group(1).lower()
+            if name not in {"c", "joinchat"}:
+                return "@" + name
 
         if raw.lower().startswith("id:"):
             maybe_id = raw[3:].strip()
             if re.fullmatch(r"-?\d+", maybe_id):
-                return f"peer:{int(maybe_id)}"
+                value = int(maybe_id)
+                return (
+                    f"peer:{value}"
+                    if value < 0
+                    else f"rawid:{value}"
+                )
 
         if re.fullmatch(r"-?\d+", raw):
-            return f"peer:{int(raw)}"
+            value = int(raw)
+            return f"peer:{value}" if value < 0 else f"rawid:{value}"
 
         return "ref:" + raw.lower()
 
     if isinstance(target, int):
-        return f"peer:{int(target)}"
+        return (
+            f"peer:{int(target)}"
+            if int(target) < 0
+            else f"rawid:{int(target)}"
+        )
 
     try:
         username = getattr(target, "username", None)
@@ -416,12 +447,11 @@ def canonical_target_key(target: Any) -> str:
     try:
         target_id = getattr(target, "id", None)
         if target_id is not None:
-            return f"peer:{int(target_id)}"
+            return f"rawid:{int(target_id)}"
     except Exception:
         pass
 
     return "ref:" + str(target).strip().lower()
-
 
 def _target_key(target: Any) -> str:
     """Backward-compatible alias for the canonical target key."""
@@ -515,14 +545,25 @@ def _has_missing_invitee(result: Any) -> bool:
 
 
 def _make_client(session_file: str, api_id: int, api_hash: str) -> TelegramClient:
-    """Создаёт sync TelethonClient по .session файлу."""
-    # session_file хранится как '<name>.session' (basename), а Telethon ждёт имя БЕЗ расширения.
+    """Create an authorized client and close partial connections on failure."""
     session_name = session_name_from_file(session_file)
-    client = TelegramClient(session_name, api_id, api_hash, flood_sleep_threshold=0)
-    client.connect()
-    if not client.is_user_authorized():
-        raise RuntimeError(f"Сессия не авторизована: {session_file}")
-    return client
+    client = TelegramClient(
+        session_name,
+        api_id,
+        api_hash,
+        flood_sleep_threshold=0,
+    )
+    try:
+        client.connect()
+        if not client.is_user_authorized():
+            raise RuntimeError(f"Сессия не авторизована: {session_file}")
+        return client
+    except Exception:
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+        raise
 
 
 
@@ -885,7 +926,8 @@ def inviting_rotate_sessions(
 
     stat_keys = (
         "ok", "already", "privacy", "forbidden", "not_mutual",
-        "user_kicked", "user_blocked", "user_channels_too_much",
+        "missing_invitee", "user_kicked", "user_blocked",
+        "user_channels_too_much",
         "floodwait", "peerflood", "invalid", "network", "resolve",
         "rpc_other", "other",
     )
@@ -1245,10 +1287,29 @@ def inviting_rotate_sessions(
                         invitee_entity,
                     )
                     if _has_missing_invitee(invite_result):
+                        # The API call consumed an invite attempt even though
+                        # Telegram declined to add this user.
+                        session_consume_invite_token(
+                            st, per_hour_limit, per_day_limit
+                        )
+                        st.fail += 1
+                        st.last_invite_at = _now()
+                        st.next_invite_at = (
+                            st.last_invite_at + max(1.0, delay)
+                        )
+                        ses_stats[sf]["missing_invitee"] += 1
                         ledger_put(
                             conn, target_key, user_key, user_id, username,
                             "skip", "missing_invitee",
                             session_file=sf,
+                        )
+                        excluded_add(
+                            conn,
+                            user_key,
+                            user_id,
+                            username,
+                            "missing_invitee",
+                            target_key=target_key,
                         )
                         skip_cnt += 1
                         completed = True
