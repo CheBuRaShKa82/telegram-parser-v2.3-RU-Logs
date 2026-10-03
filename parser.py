@@ -165,6 +165,44 @@ def quality_hard(user: Any) -> Tuple[bool, str]:
 
 # -------------------- DEDUP HELPERS --------------------
 
+def _private_text_open(
+    path: str,
+    mode: str,
+    *,
+    encoding: str = "utf-8",
+    newline: Optional[str] = None,
+):
+    """Open a local data file with mode 0600 on POSIX."""
+    if os.name == "nt":
+        return open(path, mode, encoding=encoding, newline=newline)
+
+    flags = os.O_WRONLY | os.O_CREAT
+    if "a" in mode:
+        flags |= os.O_APPEND
+    else:
+        flags |= os.O_TRUNC
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return os.fdopen(
+        fd,
+        mode,
+        encoding=encoding,
+        newline=newline,
+    )
+
+
+def _csv_safe_cell(value: Any) -> Any:
+    """Neutralize spreadsheet formula prefixes without altering non-strings."""
+    if not isinstance(value, str):
+        return value
+    if value and value[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
 def _read_set(path: str, strip_at: bool = False) -> set:
     if not os.path.exists(path):
         return set()
@@ -199,7 +237,7 @@ def _append_unique(path: str, values: Iterable[str], prefix_at: bool = False) ->
     if not new_vals:
         return 0
 
-    with open(path, "a", encoding="utf-8") as f:
+    with _private_text_open(path, "a", encoding="utf-8") as f:
         for value in new_vals:
             f.write(value + "\n")
     return len(new_vals)
@@ -223,7 +261,14 @@ def _source_metadata(
             source_type,
         )
 
-    source_id = getattr(chat_entity, "id", None)
+    source_id = None
+    try:
+        # Peer IDs preserve the namespace distinction:
+        # basic Chat -> -id, Channel/megagroup -> -100... .
+        source_id = tl_utils.get_peer_id(chat_entity)
+    except Exception:
+        source_id = getattr(chat_entity, "id", None)
+
     source_title = getattr(chat_entity, "title", None)
     if not isinstance(source_title, str):
         source_title = None
@@ -231,12 +276,6 @@ def _source_metadata(
         username = getattr(chat_entity, "username", None)
         if isinstance(username, str) and username:
             source_title = "@" + username.lstrip("@")
-
-    try:
-        if source_id is None:
-            source_id = tl_utils.get_peer_id(chat_entity)
-    except Exception:
-        pass
 
     return (
         str(source_id) if source_id is not None else None,
@@ -813,7 +852,12 @@ def export_users(
     finally:
         conn.close()
 
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(output_dir, mode=0o700, exist_ok=True)
+    if os.name != "nt":
+        try:
+            os.chmod(output_dir, 0o700)
+        except OSError:
+            pass
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     result: Dict[str, str] = {}
     normalized = {fmt.lower().strip() for fmt in formats}
@@ -825,21 +869,34 @@ def export_users(
             "source_id", "source_title", "source_type",
             "parsed_at", "last_seen_at",
         ]
-        with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+        with _private_text_open(
+            path,
+            "w",
+            encoding="utf-8-sig",
+            newline="",
+        ) as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows(
+                [
+                    {
+                        field: _csv_safe_cell(row.get(field))
+                        for field in fields
+                    }
+                    for row in rows
+                ]
+            )
         result["csv"] = path
 
     if "json" in normalized:
         path = os.path.join(output_dir, f"users_{stamp}.json")
-        with open(path, "w", encoding="utf-8") as handle:
+        with _private_text_open(path, "w", encoding="utf-8") as handle:
             json.dump(rows, handle, ensure_ascii=False, indent=2)
         result["json"] = path
 
     if "txt" in normalized:
         path = os.path.join(output_dir, f"users_{stamp}.txt")
-        with open(path, "w", encoding="utf-8") as handle:
+        with _private_text_open(path, "w", encoding="utf-8") as handle:
             for row in rows:
                 username = row.get("username") or ""
                 if username:
