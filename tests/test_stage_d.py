@@ -97,6 +97,30 @@ class ConfigMigrationTests(unittest.TestCase):
 
 
 class LoggingTests(unittest.TestCase):
+    def test_existing_log_permissions_are_repaired(self):
+        if os.name == "nt":
+            self.skipTest("POSIX permissions only")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "old.log")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("legacy\n")
+            os.chmod(path, 0o644)
+
+            logger = setup_logging(path, max_bytes=1024, backup_count=2)
+            matching = [
+                handler
+                for handler in logger.handlers
+                if isinstance(handler, RotatingFileHandler)
+                and os.path.abspath(handler.baseFilename) == os.path.abspath(path)
+            ]
+            self.assertEqual(
+                stat.S_IMODE(os.stat(path).st_mode),
+                0o600,
+            )
+            for handler in matching:
+                handler.close()
+                logger.removeHandler(handler)
+
     def test_rotating_handler_is_configured(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "app.log")
