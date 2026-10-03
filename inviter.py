@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 import re
@@ -770,6 +771,14 @@ def parse_user_ref(raw: Any) -> Tuple[str, Optional[int], Optional[str], UserCan
     return candidate.key, candidate.user_id, candidate.username, candidate
 
 
+def _privacy_user_label(user_key: str) -> str:
+    """Stable pseudonymous label for logs; raw user IDs/usernames stay in SQLite."""
+    digest = hashlib.sha256(
+        str(user_key).encode("utf-8", errors="replace")
+    ).hexdigest()[:10]
+    return f"user#{digest}"
+
+
 def resolve_user_for_client(client: TelegramClient, raw: Any) -> Any:
     """Resolve a user in this session; prefer local ID cache before network lookup."""
     candidate = candidate_from_raw(raw)
@@ -1081,7 +1090,7 @@ def inviting_rotate_sessions(
                         )
 
             user_key, user_id, username, entity = parse_user_ref(raw)
-            display_user = ("@" + username) if username else user_key
+            display_user = _privacy_user_label(user_key)
 
             prev = ledger_get(conn, target_key, user_key)
 
@@ -1754,6 +1763,7 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
 
         for raw in users:
             user_key, user_id, username, entity = parse_user_ref(raw)
+            display_user = _privacy_user_label(user_key)
 
             if excluded_has(conn, user_key, target_key=target_key):
                 skip_cnt += 1
@@ -1777,19 +1787,19 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
                     skip_cnt += 1
                     log_warn(
                         f"⏭️ Telegram не добавил "
-                        f"{('@'+username) if username else user_key}: "
+                        f"{display_user}: "
                         "missing_invitees."
                     )
                     continue
                 ledger_put(conn, target_key, user_key, user_id, username, "ok", "ok")
                 ok_cnt += 1
-                log_ok(f"✅ Инвайт отправлен: {('@'+username) if username else user_key} → {target_key}")
+                log_ok(f"✅ Инвайт отправлен: {display_user} → {target_key}")
                 delay = min(8.0, max(1.5, delay + random.uniform(-0.2, 0.4)))
 
             except UserAlreadyParticipantError:
                 ledger_put(conn, target_key, user_key, user_id, username, "already", "уже участник")
                 skip_cnt += 1
-                log_info(f"👤 Уже в чате: {('@'+username) if username else user_key}")
+                log_info(f"👤 Уже в чате: {display_user}")
 
             except UserPrivacyRestrictedError:
                 ledger_put(conn, target_key, user_key, user_id, username, "privacy", "закрыты инвайты")
@@ -1801,7 +1811,7 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
                 except Exception:
                     pass
                 skip_cnt += 1
-                log_warn(f"🔒 Закрыты инвайты: {('@'+username) if username else user_key}")
+                log_warn(f"🔒 Закрыты инвайты: {display_user}")
 
             except UserNotMutualContactError:
                 ledger_put(conn, target_key, user_key, user_id, username, "skip", "not_mutual_contact")
@@ -1813,7 +1823,7 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
                 except Exception:
                     pass
                 skip_cnt += 1
-                log_warn(f"🙅‍♂️ Не взаимный контакт/нельзя инвайтить: {('@'+username) if username else user_key}")
+                log_warn(f"🙅‍♂️ Не взаимный контакт/нельзя инвайтить: {display_user}")
 
             except UserChannelsTooMuchError:
                 ledger_put(conn, target_key, user_key, user_id, username, "skip", "user_channels_too_much")
@@ -1825,7 +1835,7 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
                 except Exception:
                     pass
                 skip_cnt += 1
-                log_warn(f"📛 У пользователя слишком много чатов/каналов: {('@'+username) if username else user_key}")
+                log_warn(f"📛 У пользователя слишком много чатов/каналов: {display_user}")
 
             except UserKickedError:
                 ledger_put(conn, target_key, user_key, user_id, username, "skip", "user_kicked")
@@ -1837,7 +1847,7 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
                 except Exception:
                     pass
                 skip_cnt += 1
-                log_warn(f"🚫 Пользователь кикнут/забанен в цели: {('@'+username) if username else user_key}")
+                log_warn(f"🚫 Пользователь кикнут/забанен в цели: {display_user}")
 
             except UserBlockedError:
                 ledger_put(conn, target_key, user_key, user_id, username, "skip", "user_blocked")
@@ -1849,13 +1859,13 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
                 except Exception:
                     pass
                 skip_cnt += 1
-                log_warn(f"🚫 Пользователь заблокирован/недоступен: {('@'+username) if username else user_key}")
+                log_warn(f"🚫 Пользователь заблокирован/недоступен: {display_user}")
 
             except ChatWriteForbiddenError as e:
                 diag = _diagnose_invite_context(client, target_entity)
                 ledger_put(conn, target_key, user_key, user_id, username, "forbidden", f"{type(e).__name__}")
                 fail_cnt += 1
-                log_warn(f"🚫 ChatWriteForbidden при инвайте {('@'+username) if username else user_key} → {target_key}. Диагностика: {diag}")
+                log_warn(f"🚫 ChatWriteForbidden при инвайте {display_user} → {target_key}. Диагностика: {diag}")
 
             except FloodWaitError as e:
                 sec = int(getattr(e, "seconds", 0) or 0)
