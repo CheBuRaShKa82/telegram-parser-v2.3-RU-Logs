@@ -404,6 +404,33 @@ def canonical_target_key(target: Any) -> str:
         if match:
             return "invite:" + match.group(1).lower()
 
+        # Public channel preview links: t.me/s/<username>
+        match = re.match(
+            r"^(?:https?://)?(?:t\.me|telegram\.me)/s/([A-Za-z0-9_]+)(?:/.*)?$",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return "@" + match.group(1).lower()
+
+        # Telegram service routes are not usernames.
+        service_route = re.match(
+            r"^(?:https?://)?(?:t\.me|telegram\.me)/([^/?#]+)(?:/.*)?$",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if service_route and service_route.group(1).lower() in {
+            "addlist",
+            "share",
+            "proxy",
+            "socks",
+            "login",
+            "iv",
+            "contact",
+            "setlanguage",
+        }:
+            return "ref:" + raw.lower()
+
         # Public username links.
         match = re.match(
             r"^(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]+)(?:/.*)?$",
@@ -412,7 +439,19 @@ def canonical_target_key(target: Any) -> str:
         )
         if match:
             name = match.group(1).lower()
-            if name not in {"c", "joinchat"}:
+            if name not in {
+                "c",
+                "joinchat",
+                "s",
+                "addlist",
+                "share",
+                "proxy",
+                "socks",
+                "login",
+                "iv",
+                "contact",
+                "setlanguage",
+            }:
                 return "@" + name
 
         if raw.lower().startswith("id:"):
