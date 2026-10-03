@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import hashlib
+import hmac
 import os
 import random
 import re
@@ -52,6 +52,7 @@ from storage import (
     exclusion_has,
     exclusion_load_keys,
     exclusion_reason,
+    get_or_create_log_hmac_key,
     invite_record,
     invite_state_get,
 )
@@ -813,11 +814,13 @@ def parse_user_ref(raw: Any) -> Tuple[str, Optional[int], Optional[str], UserCan
     return candidate.key, candidate.user_id, candidate.username, candidate
 
 
-def _privacy_user_label(user_key: str) -> str:
-    """Stable pseudonymous label for logs; raw user IDs/usernames stay in SQLite."""
-    digest = hashlib.sha256(
-        str(user_key).encode("utf-8", errors="replace")
-    ).hexdigest()[:10]
+def _privacy_user_label(user_key: str, secret: bytes) -> str:
+    """Stable keyed pseudonym; raw user IDs/usernames stay in SQLite only."""
+    digest = hmac.new(
+        secret,
+        str(user_key).encode("utf-8", errors="replace"),
+        "sha256",
+    ).hexdigest()[:12]
     return f"user#{digest}"
 
 
@@ -836,13 +839,16 @@ def resolve_user_for_client(client: TelegramClient, raw: Any) -> Any:
     if candidate.username:
         username = "@" + candidate.username.lstrip("@")
         try:
+            # get_input_entity already performs the necessary username
+            # resolution when the entity is not cached. Do not immediately
+            # repeat the same lookup through get_entity().
             return client.get_input_entity(username)
         except FloodWaitError:
             raise
-        except (ValueError, TypeError):
-            # Explicit username lookup may use the network; FloodWait must
-            # propagate to the scheduler and block this session.
-            return client.get_entity(username)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                "Не удалось определить username в текущей сессии"
+            ) from exc
 
     raise ValueError("Не удалось определить пользователя в текущей сессии")
 
@@ -853,6 +859,7 @@ def prune_users_files(target: Union[str, int, Any], statuses: Tuple[str, ...] = 
     Делает backup файлов *.bak-YYYYmmdd-HHMMSS
     """
     conn = _db()
+    log_hmac_key = get_or_create_log_hmac_key(conn)
     target_key = _target_key(target)
 
     removed = 0
@@ -955,6 +962,8 @@ def inviting_rotate_sessions(
     night_start: Tuple[int, int] = (2, 0),
     night_end: Tuple[int, int] = (7, 0),
     night_sleep_jitter: Tuple[float, float] = (30.0, 120.0),
+    network_retry_limit: int = 3,
+    network_retry_base_seconds: int = 5,
 ) -> None:
     """Invite with per-user retry and per-session isolation.
 
@@ -972,6 +981,10 @@ def inviting_rotate_sessions(
     max_attempts_per_session = max(0, int(max_attempts_per_session or 0))
     per_hour_limit = max(0, int(per_hour_limit or 0))
     per_day_limit = max(0, int(per_day_limit or 0))
+    network_retry_limit = max(1, int(network_retry_limit or 1))
+    network_retry_base_seconds = max(
+        1, int(network_retry_base_seconds or 1)
+    )
 
     st_map = session_stats_load(conn, session_files)
     states = [st_map[sf] for sf in session_files]
@@ -995,6 +1008,7 @@ def inviting_rotate_sessions(
 
     ok_in_session = {sf: 0 for sf in session_files}
     attempts_in_session = {sf: 0 for sf in session_files}
+    network_failures = {sf: 0 for sf in session_files}
     retired_for_run: set[str] = set()
     client_cache: Dict[str, TelegramClient] = {}
 
@@ -1029,6 +1043,7 @@ def inviting_rotate_sessions(
             c = _make_client(sf, api_id, api_hash)
             st.banned = False
             _set_session_status(st, "active", "")
+            network_failures[sf] = 0
             persist(st)
             client_cache[sf] = c
             return c
@@ -1044,13 +1059,26 @@ def inviting_rotate_sessions(
         except (OSError, ConnectionError) as exc:
             st.fail += 1
             st.attempts += 1
-            st.blocked_until = max(st.blocked_until, _now() + 60)
+            network_failures[sf] += 1
+            backoff = min(
+                60,
+                network_retry_base_seconds
+                * (2 ** (network_failures[sf] - 1)),
+            )
+            st.blocked_until = max(st.blocked_until, _now() + backoff)
             _set_session_status(st, "temporary_blocked", type(exc).__name__)
-            retired_for_run.add(sf)
+            if network_failures[sf] >= network_retry_limit:
+                retired_for_run.add(sf)
+                suffix = "исключена до следующего запуска"
+            else:
+                suffix = (
+                    f"переподключение "
+                    f"{network_failures[sf]}/{network_retry_limit}"
+                )
             persist(st)
             log_warn(
                 f"🌐 {sf}: ошибка подключения {type(exc).__name__}; "
-                "сессия исключена до следующего запуска."
+                f"{suffix}, пауза {backoff}с."
             )
             return None
         except Exception as exc:
@@ -1132,7 +1160,7 @@ def inviting_rotate_sessions(
                         )
 
             user_key, user_id, username, entity = parse_user_ref(raw)
-            display_user = _privacy_user_label(user_key)
+            display_user = _privacy_user_label(user_key, log_hmac_key)
 
             prev = ledger_get(conn, target_key, user_key)
 
@@ -1399,6 +1427,7 @@ def inviting_rotate_sessions(
                     session_consume_invite_token(
                         st, per_hour_limit, per_day_limit
                     )
+                    network_failures[sf] = 0
                     st.ok += 1
                     st.last_invite_at = _now()
                     st.next_invite_at = (
@@ -1646,11 +1675,34 @@ def inviting_rotate_sessions(
                         session_file=sf,
                     )
                     drop_client(sf)
+                    network_failures[sf] += 1
+                    backoff = min(
+                        60,
+                        network_retry_base_seconds
+                        * (2 ** (network_failures[sf] - 1)),
+                    )
+                    st.blocked_until = max(
+                        st.blocked_until, _now() + backoff
+                    )
+                    # Transport failure is retried separately from the
+                    # per-user Telegram action budget.
+                    attempts_for_user = max(0, attempts_for_user - 1)
+                    attempts_in_session[sf] = max(
+                        0, attempts_in_session[sf] - 1
+                    )
+                    st.attempts = max(0, st.attempts - 1)
+                    if network_failures[sf] >= network_retry_limit:
+                        retired_for_run.add(sf)
+                        suffix = "лимит переподключений исчерпан"
+                    else:
+                        suffix = (
+                            f"переподключение "
+                            f"{network_failures[sf]}/{network_retry_limit}"
+                        )
                     tried_sessions.add(sf)
-                    retired_for_run.add(sf)
                     log_warn(
                         f"🌐 {sf}: {type(exc).__name__}; "
-                        "сессия исключена до следующего запуска."
+                        f"{suffix}, пауза {backoff}с."
                     )
 
                 except RPCError as exc:
@@ -1792,6 +1844,7 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
     - учитывает global excluded_users (вечные отказы)
     """
     conn = _db()
+    log_hmac_key = get_or_create_log_hmac_key(conn)
     try:
         target_key = _target_key(target)
         log_info(f"🚀 Старт инвайта в: {target_key}. Кандидатов: {len(users)}")
@@ -1805,7 +1858,7 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
 
         for raw in users:
             user_key, user_id, username, entity = parse_user_ref(raw)
-            display_user = _privacy_user_label(user_key)
+            display_user = _privacy_user_label(user_key, log_hmac_key)
 
             if excluded_has(conn, user_key, target_key=target_key):
                 skip_cnt += 1
