@@ -706,6 +706,17 @@ def do_inviting() -> None:
     time.sleep(1.5)
 
 
+def _run_menu_action(action) -> None:
+    """Keep one action failure from terminating the interactive application."""
+    try:
+        action()
+    except Exception as exc:
+        print(
+            f"Ошибка операции: {type(exc).__name__}: {exc}"
+        )
+        time.sleep(2)
+
+
 def main() -> None:
     while True:
         clear()
@@ -720,17 +731,17 @@ def main() -> None:
         key = input("Ввод: ").strip()
 
         if key == "1":
-            config()
+            _run_menu_action(config)
         elif key == "2":
-            do_parsing()
+            _run_menu_action(do_parsing)
         elif key == "3":
-            do_parsing_messages()
+            _run_menu_action(do_parsing_messages)
         elif key == "4":
-            do_parsing_comments()
+            _run_menu_action(do_parsing_comments)
         elif key == "5":
-            do_export_users()
+            _run_menu_action(do_export_users)
         elif key == "6":
-            do_inviting()
+            _run_menu_action(do_inviting)
         elif key == "7":
             break
         else:
