@@ -68,24 +68,31 @@ def setup_logging(
     return logger
 
 
-LOGGER = setup_logging()
+LOGGER = logging.getLogger(LOGGER_NAME)
+LOGGER.setLevel(logging.INFO)
+LOGGER.propagate = False
+
+
+def _logger() -> logging.Logger:
+    # Keep imports side-effect free: app.log is created on first real log write.
+    return setup_logging()
 
 
 def log_info(msg: str) -> None:
-    LOGGER.info(msg)
+    _logger().info(msg)
 
 
 def log_ok(msg: str) -> None:
-    LOGGER.info("УСПЕХ | %s", msg)
+    _logger().info("УСПЕХ | %s", msg)
 
 
 def log_warn(msg: str) -> None:
-    LOGGER.warning(msg)
+    _logger().warning(msg)
 
 
 def log_pause(msg: str) -> None:
-    LOGGER.info("ПАУЗА | %s", msg)
+    _logger().info("ПАУЗА | %s", msg)
 
 
 def log_stop(msg: str) -> None:
-    LOGGER.error(msg)
+    _logger().error(msg)
