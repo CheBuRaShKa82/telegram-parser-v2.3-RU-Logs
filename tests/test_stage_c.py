@@ -1,9 +1,13 @@
+import csv
 import json
 import os
 import tempfile
+import stat
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+
+from telethon.tl.types import PeerChannel, PeerChat
 
 import parser as parser_mod
 from storage import checkpoint_get, checkpoint_put, connect_db, export_users_rows
@@ -126,6 +130,19 @@ class SourceMetadataTests(unittest.TestCase):
             ),
             "messages:@manual_group",
         )
+
+    def test_chat_and_channel_same_raw_id_have_distinct_source_ids(self):
+        chat_id, _, _ = parser_mod._source_metadata(
+            PeerChat(123),
+            "participants",
+        )
+        channel_id, _, _ = parser_mod._source_metadata(
+            PeerChannel(123),
+            "participants",
+        )
+        self.assertNotEqual(chat_id, channel_id)
+        self.assertEqual(chat_id, "-123")
+        self.assertEqual(channel_id, "-1000000000123")
 
 
 class ParserCheckpointTests(unittest.TestCase):
@@ -497,8 +514,8 @@ class ExportTests(unittest.TestCase):
         user = SimpleNamespace(
             id=42,
             username="exported",
-            first_name="Ex",
-            last_name="Port",
+            first_name="=2+2",
+            last_name="@formula",
         )
         with tempfile.TemporaryDirectory() as tmp:
             db = os.path.join(tmp, "export.db")
@@ -524,6 +541,28 @@ class ExportTests(unittest.TestCase):
             with open(paths["json"], "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
             self.assertEqual(payload[0]["user_id"], 42)
+            self.assertEqual(payload[0]["first_name"], "=2+2")
+
+            with open(
+                paths["csv"],
+                "r",
+                encoding="utf-8-sig",
+                newline="",
+            ) as handle:
+                csv_row = next(csv.DictReader(handle))
+            self.assertEqual(csv_row["first_name"], "'=2+2")
+            self.assertEqual(csv_row["last_name"], "'@formula")
+
+            if os.name != "nt":
+                for path in paths.values():
+                    self.assertEqual(
+                        stat.S_IMODE(os.stat(path).st_mode),
+                        0o600,
+                    )
+                self.assertEqual(
+                    stat.S_IMODE(os.stat(out).st_mode),
+                    0o700,
+                )
 
 
 if __name__ == "__main__":
