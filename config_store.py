@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from datetime import datetime
 from typing import List, Optional
 
 
@@ -37,6 +37,33 @@ def _parse_bool(value: str, default: bool = True) -> bool:
     if value in ("false", "0", "no", "n", "нет", "н"):
         return False
     return default
+
+
+def _json_bool(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return _parse_bool(value, default)
+    return default
+
+
+def _backup_broken_config(path: str) -> Optional[str]:
+    if not os.path.exists(path):
+        return None
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = f"{path}.broken-{stamp}"
+    suffix = 1
+    while os.path.exists(backup):
+        backup = f"{path}.broken-{stamp}-{suffix}"
+        suffix += 1
+    try:
+        os.replace(path, backup)
+        _secure_file(backup)
+        return backup
+    except OSError:
+        return None
 
 
 def _from_legacy_lines(lines: List[str]) -> AppConfig:
@@ -111,7 +138,14 @@ def load_config(path: str = CONFIG_PATH) -> AppConfig:
     try:
         with open(path, "r", encoding="utf-8") as handle:
             raw = json.load(handle)
+        if not isinstance(raw, dict):
+            raise ValueError("config root must be an object")
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        # Never silently destroy the only copy of API credentials.
+        backup = _backup_broken_config(path)
+        if backup is None and os.path.exists(path):
+            # If backup failed, leave the broken config untouched.
+            return AppConfig()
         config = AppConfig()
         save_config(config, path)
         return config
@@ -127,8 +161,8 @@ def load_config(path: str = CONFIG_PATH) -> AppConfig:
     config = AppConfig(
         api_id=api_id,
         api_hash=str(raw.get("api_hash") or ""),
-        parse_user_id=bool(raw.get("parse_user_id", True)),
-        parse_username=bool(raw.get("parse_username", True)),
+        parse_user_id=_json_bool(raw.get("parse_user_id", True), True),
+        parse_username=_json_bool(raw.get("parse_username", True), True),
     )
     _secure_file(path)
     return config
