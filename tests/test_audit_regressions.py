@@ -2,10 +2,14 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
+
+import main as main_mod
 
 import inviter
 from storage import (
     connect_db,
+    get_or_create_log_hmac_key,
     list_user_sources,
     load_user_candidates,
     upsert_user,
@@ -146,6 +150,86 @@ class LimitRegressionTests(unittest.TestCase):
         inviter.session_consume_invite_token(st, -1, -5)
         self.assertEqual(st.hour_count, before_hour)
         self.assertEqual(st.day_count, before_day)
+
+
+class SchemaMigrationTests(unittest.TestCase):
+    def test_v6_positive_numeric_checkpoint_is_reset_on_v7(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "migration.db")
+            conn = connect_db(db)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO parser_checkpoints(
+                    checkpoint_key, source_id, source_title, mode,
+                    cursor_int, processed, saved, status, updated_at
+                )
+                VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "messages:123",
+                    "123",
+                    "Legacy",
+                    "messages",
+                    99,
+                    10,
+                    5,
+                    "running",
+                    "2026-10-01T00:00:00+00:00",
+                ),
+            )
+            conn.execute(
+                "UPDATE schema_meta SET value='6' "
+                "WHERE key='schema_version'"
+            )
+            conn.commit()
+            conn.close()
+
+            conn = connect_db(db)
+            row = conn.execute(
+                "SELECT 1 FROM parser_checkpoints "
+                "WHERE checkpoint_key='messages:123'"
+            ).fetchone()
+            version = conn.execute(
+                "SELECT value FROM schema_meta WHERE key='schema_version'"
+            ).fetchone()[0]
+            self.assertIsNone(row)
+            self.assertEqual(version, "7")
+            conn.close()
+
+
+class PrivacyLabelTests(unittest.TestCase):
+    def test_log_hmac_key_is_stable_per_database_and_not_global(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db1 = os.path.join(tmp, "one.db")
+            db2 = os.path.join(tmp, "two.db")
+
+            conn1 = connect_db(db1)
+            key1a = get_or_create_log_hmac_key(conn1)
+            key1b = get_or_create_log_hmac_key(conn1)
+            label1 = inviter._privacy_user_label("id:42", key1a)
+            conn1.close()
+
+            conn2 = connect_db(db2)
+            key2 = get_or_create_log_hmac_key(conn2)
+            label2 = inviter._privacy_user_label("id:42", key2)
+            conn2.close()
+
+            self.assertEqual(key1a, key1b)
+            self.assertNotEqual(key1a, key2)
+            self.assertNotEqual(label1, label2)
+            self.assertTrue(label1.startswith("user#"))
+
+
+class MenuIsolationTests(unittest.TestCase):
+    def test_menu_action_catches_recoverable_exception(self):
+        def broken_action():
+            raise RuntimeError("private source")
+
+        with (
+            patch.object(main_mod.time, "sleep", return_value=None),
+            patch("builtins.print"),
+        ):
+            main_mod._run_menu_action(broken_action)
 
 
 class RpcClassificationTests(unittest.TestCase):
