@@ -27,6 +27,7 @@ from config_ui import config, getoptions
 from inviter import (
     inviting_rotate_sessions,
     preflight_sessions_for_target,
+    resolve_target_for_client,
     target_ref,
 )
 from parser import (
@@ -193,15 +194,36 @@ def pick_sessions() -> List[str]:
     return uniq
 
 
-def make_client(session_file: str, api_id: int, api_hash: str) -> TelegramClient:
-    # session_file хранится как '<name>.session' (basename), а сами файлы лежат в папке sessoins/
+def make_client(
+    session_file: str,
+    api_id: int,
+    api_hash: str,
+) -> Optional[TelegramClient]:
+    """Open one session for interactive CLI use without exiting the app."""
     session_name = session_name_from_file(session_file)
-    client = TelegramClient(session_name, api_id, api_hash, flood_sleep_threshold=0)
-    client.connect()
-    if not client.is_user_authorized():
-        print(f"Сессия не авторизована. Создай её заново в Настройках (пункт 5). Папка: {SESSIONS_DIR}/")
-        raise SystemExit(1)
-    return client
+    client = TelegramClient(
+        session_name,
+        api_id,
+        api_hash,
+        flood_sleep_threshold=0,
+    )
+    try:
+        client.connect()
+        if not client.is_user_authorized():
+            print(
+                "Сессия не авторизована. Создай её заново в Настройках "
+                f"(пункт 5). Папка: {SESSIONS_DIR}/"
+            )
+            client.disconnect()
+            return None
+        return client
+    except Exception as exc:
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+        print(f"Не удалось открыть сессию: {type(exc).__name__}")
+        return None
 
 
 def do_parsing() -> None:
@@ -223,6 +245,9 @@ def do_parsing() -> None:
     parse_name = (opts[3].strip() == "True")
 
     client = make_client(sess, api_id, api_hash)
+    if client is None:
+        time.sleep(1.5)
+        return
     src = pick_dialog(client, "Источник (чат/канал) для парсинга (@username/ссылка/id): ")
     if not src:
         client.disconnect()
@@ -337,6 +362,9 @@ def do_parsing_messages() -> None:
     api_hash = opts[1].strip()
 
     client = make_client(sess, api_id, api_hash)
+    if client is None:
+        time.sleep(1.5)
+        return
     src = pick_dialog(client, "Источник (чат/канал/группа): ")
     if not src:
         client.disconnect()
@@ -397,6 +425,9 @@ def do_parsing_comments() -> None:
     api_id = int(opts[0].strip())
     api_hash = opts[1].strip()
     client = make_client(sess, api_id, api_hash)
+    if client is None:
+        time.sleep(1.5)
+        return
     src = pick_dialog(client, "Broadcast-канал с комментариями: ")
     if not src:
         client.disconnect()
@@ -485,12 +516,21 @@ def do_inviting() -> None:
 
     # Берём первую сессию, чтобы выбрать цель из диалогов
     client = make_client(sess_list[0], api_id, api_hash)
+    if client is None:
+        time.sleep(1.5)
+        return
     target_entity = pick_dialog(client, "Куда инвайтить? (@username/ссылка/id): ")
     if not target_entity:
         client.disconnect()
         return
 
-    # Важно: делаем target переносимым между сессиями
+    # Resolve manual refs before deriving a portable/canonical peer reference.
+    try:
+        target_entity = resolve_target_for_client(client, target_entity)
+    except Exception as exc:
+        print(f"Не удалось определить целевую группу: {type(exc).__name__}")
+        client.disconnect()
+        return
     target = target_ref(target_entity)
 
     users = pick_user_queue()
@@ -528,7 +568,7 @@ def do_inviting() -> None:
         "(0 = без лимита), по умолчанию 20: "
     ).strip()
     try:
-        max_attempts = int(ma_raw) if ma_raw else 20
+        max_attempts = max(0, int(ma_raw)) if ma_raw else 20
     except ValueError:
         max_attempts = 20
 
@@ -562,7 +602,7 @@ def do_inviting() -> None:
     ).strip()
     try:
         max_user_attempts = (
-            int(ua_raw) if ua_raw else default_user_attempts
+            max(1, int(ua_raw)) if ua_raw else default_user_attempts
         )
     except ValueError:
         max_user_attempts = default_user_attempts
@@ -596,11 +636,11 @@ def do_inviting() -> None:
         "(0 = выключить), по умолчанию 30: "
     ).strip()
     try:
-        per_hour = int(ph_raw) if ph_raw else 10
+        per_hour = max(0, int(ph_raw)) if ph_raw else 10
     except ValueError:
         per_hour = 10
     try:
-        per_day = int(pd_raw) if pd_raw else 30
+        per_day = max(0, int(pd_raw)) if pd_raw else 30
     except ValueError:
         per_day = 30
 
