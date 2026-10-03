@@ -456,11 +456,13 @@ def target_ref(target: Any) -> Union[str, int, Any]:
 
 
 def resolve_target_for_client(client: TelegramClient, target: Any) -> Any:
-    """Resolve target with the current session; never reuse another session's InputEntity."""
+    """Resolve target inside the current session without swallowing FloodWait."""
     ref = target_ref(target)
     try:
         return client.get_input_entity(ref)
-    except Exception:
+    except FloodWaitError:
+        raise
+    except (ValueError, TypeError):
         return client.get_entity(ref)
 
 
@@ -724,16 +726,28 @@ def parse_user_ref(raw: Any) -> Tuple[str, Optional[int], Optional[str], UserCan
 
 
 def resolve_user_for_client(client: TelegramClient, raw: Any) -> Any:
-    """Resolve a user independently inside the current Telegram session."""
+    """Resolve a user in this session; prefer local ID cache before network lookup."""
     candidate = candidate_from_raw(raw)
-    if candidate.username:
-        try:
-            return client.get_input_entity("@" + candidate.username)
-        except Exception:
-            pass
+
     if candidate.user_id is not None:
-        # This succeeds only when this session knows the entity/access_hash.
-        return client.get_input_entity(int(candidate.user_id))
+        try:
+            return client.get_input_entity(int(candidate.user_id))
+        except FloodWaitError:
+            raise
+        except (ValueError, TypeError):
+            pass
+
+    if candidate.username:
+        username = "@" + candidate.username.lstrip("@")
+        try:
+            return client.get_input_entity(username)
+        except FloodWaitError:
+            raise
+        except (ValueError, TypeError):
+            # Explicit username lookup may use the network; FloodWait must
+            # propagate to the scheduler and block this session.
+            return client.get_entity(username)
+
     raise ValueError("Не удалось определить пользователя в текущей сессии")
 
 def prune_users_files(target: Union[str, int, Any], statuses: Tuple[str, ...] = ("ok","already","privacy","invalid"), include_excluded: bool = True) -> Tuple[int,int]:
@@ -1166,6 +1180,28 @@ def inviting_rotate_sessions(
                             "пробую другую сессию."
                         )
                         tried_sessions.add(sf)
+                        continue
+                    except FloodWaitError as exc:
+                        sec = max(0, int(getattr(exc, "seconds", 0) or 0))
+                        ses_stats[sf]["floodwait"] += 1
+                        st.fail += 1
+                        fail_cnt += 1
+                        st.blocked_until = max(
+                            st.blocked_until,
+                            _now() + sec + int(floodwait_buffer_seconds),
+                        )
+                        _set_session_status(st, "flood_wait", f"{sec}s")
+                        ledger_put(
+                            conn, target_key, user_key, user_id, username,
+                            "floodwait", f"resolve:{sec}",
+                            session_file=sf,
+                            flood_seconds=sec,
+                        )
+                        tried_sessions.add(sf)
+                        log_pause(
+                            f"💤 {sf}: FloodWait {sec}s во время resolve; "
+                            "сессия поставлена на паузу."
+                        )
                         continue
                     except (OSError, ConnectionError) as exc:
                         ses_stats[sf]["network"] += 1
