@@ -390,7 +390,8 @@ def canonical_target_key(target: Any) -> str:
             flags=re.IGNORECASE,
         )
         if match:
-            return f"peer:-100{int(match.group(1))}"
+            channel_id = int(match.group(1))
+            return f"peer:{-(1000000000000 + channel_id)}"
 
         # Invite links are unique references, not usernames.
         match = re.match(
