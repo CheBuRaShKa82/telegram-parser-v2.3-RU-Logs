@@ -396,18 +396,20 @@ def load_user_candidates(
     where: List[str] = []
     params: List[Any] = []
 
+    source_predicates: List[str] = []
     if source_id is not None:
-        where.append(
-            "EXISTS (SELECT 1 FROM user_sources us "
-            "WHERE us.user_id=u.user_id AND us.source_id=?)"
-        )
+        source_predicates.append("us.source_id=?")
         params.append(str(source_id))
     if source_type is not None:
+        source_predicates.append("us.source_type=?")
+        params.append(str(source_type))
+    if source_predicates:
         where.append(
             "EXISTS (SELECT 1 FROM user_sources us "
-            "WHERE us.user_id=u.user_id AND us.source_type=?)"
+            "WHERE us.user_id=u.user_id AND "
+            + " AND ".join(source_predicates)
+            + ")"
         )
-        params.append(str(source_type))
 
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
     rows = conn.execute(
