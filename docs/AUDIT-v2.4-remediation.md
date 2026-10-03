@@ -190,3 +190,33 @@ CI не может проверить реальные права аккаунт
 - TXT legacy-export при Ctrl+C (канонические SQLite данные и checkpoint при этом сохраняются).
 
 Эти пункты не меняют исправления high/medium-priority логики, но подходят для следующего cleanup/release этапа.
+
+
+## Третий аудит — 2026-10-03
+
+Дополнительная статическая проверка выявила несколько регрессий/хвостов после второго remediation. Подтверждённые пункты исправлены:
+
+- CSV formula protection больше не меняет технические поля: marked `source_id=-100...` экспортируется без ведущего апострофа;
+- `t.me/s/<channel>` нормализуется как публичный channel username, а Telegram service routes `addlist/share/proxy/socks/login/iv/contact/setlanguage` не принимаются за usernames;
+- исключение внутри пункта интерактивного меню больше не завершает всё приложение: действия запускаются через общий recoverable wrapper;
+- временный сетевой разрыв не выбрасывает session после первой ошибки: используется до 3 reconnect-попыток с экспоненциальным backoff, затем session исключается из текущего run;
+- failed username lookup больше не дублируется немедленным вторым `get_entity()` запросом;
+- schema поднята до v7; несовместимые старые positive-numeric parser checkpoints одноразово сбрасываются, при этом users/history сохраняются;
+- лог-псевдонимы теперь HMAC-based с локальным случайным ключом из защищённой SQLite, а не unsalted SHA-256;
+- raw `raw/user_key` удалены и из legacy `inviting()` error-логов;
+- default logger кэшируется после первого создания, поэтому `Path.resolve()` не выполняется на каждой записи;
+- существующий старый `app.log` при открытии получает POSIX mode `0600`.
+
+Добавлены regression tests на CSV marked source IDs, Telegram service links, отсутствие duplicate username lookup, single-session reconnect, schema v7 migration, HMAC labels, menu exception isolation и восстановление permissions старого log-файла.
+
+### Остающиеся low-priority пункты после третьего аудита
+
+- `parser.py` всё ещё совпадает по имени со stdlib module;
+- compatibility `defunc.py` и старый `inviting()` ещё существуют;
+- aliases пути БД `DB_PATH/LEDGER_DB` ещё не сведены в единый config object;
+- dependency lock с hashes не добавлен;
+- automatic retention/purge scheduler не добавлен;
+- Windows ACL/session encryption остаются platform-specific задачей;
+- ruff в CI пока проверяет fatal-набор, а не полный style profile;
+- при Ctrl+C legacy TXT-export не гарантируется, хотя SQLite/checkpoint сохраняются;
+- широкие parser exception handlers по-прежнему могут вернуть управление в CLI после частичной ошибки; это стоит заменить явным status/result contract в следующем cleanup этапе.
