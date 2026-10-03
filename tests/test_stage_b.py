@@ -12,6 +12,7 @@ from storage import (
     UserCandidate,
     connect_db,
     exclusion_add,
+    exclusion_has,
     invite_event_count,
     invite_record,
     invite_state_get,
@@ -118,6 +119,27 @@ class TargetKeyTests(unittest.TestCase):
             inviter.canonical_target_key("@ExampleName"),
             inviter.canonical_target_key("https://t.me/examplename"),
         )
+
+    def test_private_post_links_do_not_collapse_to_at_c(self):
+        self.assertEqual(
+            inviter.canonical_target_key("https://t.me/c/123/45"),
+            "peer:-100123",
+        )
+        self.assertNotEqual(
+            inviter.canonical_target_key("https://t.me/c/123/45"),
+            inviter.canonical_target_key("https://t.me/c/456/45"),
+        )
+
+    def test_invite_links_are_unique_not_fake_usernames(self):
+        a = inviter.canonical_target_key(
+            "https://t.me/joinchat/AAAA1111"
+        )
+        b = inviter.canonical_target_key(
+            "https://t.me/+BBBB2222"
+        )
+        self.assertEqual(a, "invite:aaaa1111")
+        self.assertEqual(b, "invite:bbbb2222")
+        self.assertNotEqual(a, b)
 
 
 class SessionSchedulerTests(unittest.TestCase):
@@ -391,6 +413,56 @@ class InviteOutcomeTests(unittest.TestCase):
                 invite_state_get(conn, target, "id:42"),
                 ("skip", "missing_invitee"),
             )
+            self.assertTrue(
+                exclusion_has(
+                    conn,
+                    "id:42",
+                    target_key=target,
+                )
+            )
+            hour_count, day_count, next_invite_at = conn.execute(
+                "SELECT hour_count, day_count, next_invite_at "
+                "FROM session_stats WHERE session_file='a.session'"
+            ).fetchone()
+            # Re-run with explicit rolling limits so the returned-but-missing
+            # API request consumes a real slot.
+            conn.close()
+
+            db2 = os.path.join(tmp, "missing-limits.db")
+            client2 = RetryIntegrationTests.FakeClient(missing=True)
+            with (
+                patch.object(inviter, "LEDGER_DB", db2),
+                patch.object(inviter, "_make_client", return_value=client2),
+                patch.object(
+                    inviter, "resolve_target_for_client", return_value=object()
+                ),
+                patch.object(
+                    inviter, "resolve_user_for_client", return_value=object()
+                ),
+                patch.object(inviter.time, "sleep", return_value=None),
+            ):
+                inviter.inviting_rotate_sessions(
+                    api_id=1,
+                    api_hash="hash",
+                    session_files=["a.session"],
+                    target="@Target",
+                    users=[UserCandidate(42, "tester")],
+                    max_user_attempts=1,
+                    max_attempts_per_session=1,
+                    per_hour_limit=10,
+                    per_day_limit=30,
+                    jitter_min=0.0,
+                    jitter_max=0.0,
+                )
+
+            conn = connect_db(db2)
+            hour_count, day_count, next_invite_at = conn.execute(
+                "SELECT hour_count, day_count, next_invite_at "
+                "FROM session_stats WHERE session_file='a.session'"
+            ).fetchone()
+            self.assertEqual(hour_count, 1)
+            self.assertEqual(day_count, 1)
+            self.assertGreater(next_invite_at, 0)
             conn.close()
 
 
