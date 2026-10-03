@@ -1692,11 +1692,18 @@ def inviting_rotate_sessions(
             if not completed and not stop_all:
                 exhausted_cnt += 1
                 skip_cnt += 1
-                ledger_put(
-                    conn, target_key, user_key, user_id, username,
-                    "skip", f"max_user_attempts={user_limit}",
-                    count_attempt=False,
-                )
+                current_state = ledger_get(conn, target_key, user_key)
+                # Preserve actionable scheduler state instead of masking it
+                # with a generic max-attempts skip.
+                if not current_state or current_state[0] not in (
+                    "floodwait",
+                    "peerflood",
+                ):
+                    ledger_put(
+                        conn, target_key, user_key, user_id, username,
+                        "skip", f"max_user_attempts={user_limit}",
+                        count_attempt=False,
+                    )
                 log_warn(
                     f"⏭️ {display_user}: исчерпан лимит "
                     f"{user_limit} попыток."
