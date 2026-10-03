@@ -859,7 +859,6 @@ def prune_users_files(target: Union[str, int, Any], statuses: Tuple[str, ...] = 
     Делает backup файлов *.bak-YYYYmmdd-HHMMSS
     """
     conn = _db()
-    log_hmac_key = get_or_create_log_hmac_key(conn)
     target_key = _target_key(target)
 
     removed = 0
@@ -975,6 +974,7 @@ def inviting_rotate_sessions(
         raise ValueError("Не переданы session_files")
 
     conn = _db()
+    log_hmac_key = get_or_create_log_hmac_key(conn)
     target_key = _target_key(target)
     delay = max(1.0, float(base_delay))
     user_limit = max(1, int(max_user_attempts or len(session_files) or 1))
