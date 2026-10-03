@@ -26,6 +26,10 @@ class SecureRotatingFileHandler(RotatingFileHandler):
         else:
             flags |= os.O_TRUNC
         fd = os.open(self.baseFilename, flags, 0o600)
+        try:
+            os.chmod(self.baseFilename, 0o600)
+        except OSError:
+            pass
         return os.fdopen(
             fd,
             self.mode,
@@ -74,7 +78,9 @@ LOGGER.propagate = False
 
 
 def _logger() -> logging.Logger:
-    # Keep imports side-effect free: app.log is created on first real log write.
+    # Keep imports side-effect free and avoid Path.resolve() on every message.
+    if LOGGER.handlers:
+        return LOGGER
     return setup_logging()
 
 
