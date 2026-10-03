@@ -877,10 +877,20 @@ def export_users(
         ) as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
+            safe_text_fields = {
+                "username",
+                "first_name",
+                "last_name",
+                "source_title",
+            }
             writer.writerows(
                 [
                     {
-                        field: _csv_safe_cell(row.get(field))
+                        field: (
+                            _csv_safe_cell(row.get(field))
+                            if field in safe_text_fields
+                            else row.get(field)
+                        )
                         for field in fields
                     }
                     for row in rows
