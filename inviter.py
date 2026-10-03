@@ -1043,7 +1043,6 @@ def inviting_rotate_sessions(
             c = _make_client(sf, api_id, api_hash)
             st.banned = False
             _set_session_status(st, "active", "")
-            network_failures[sf] = 0
             persist(st)
             client_cache[sf] = c
             return c
