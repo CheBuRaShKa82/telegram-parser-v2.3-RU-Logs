@@ -357,9 +357,11 @@ def session_next_time_due_to_limits(st: "SessionState", per_hour_limit: int, per
 
 
 def session_consume_invite_token(st: "SessionState", per_hour_limit: int, per_day_limit: int) -> None:
-    """Consume one rolling invite slot; negative limits are disabled."""
+    """Consume one rolling invite slot; disabled limits are a no-op."""
     per_hour_limit = max(0, int(per_hour_limit or 0))
     per_day_limit = max(0, int(per_day_limit or 0))
+    if per_hour_limit == 0 and per_day_limit == 0:
+        return
     now = _now()
     if getattr(st, "hour_window_start", 0) <= 0 or now - st.hour_window_start >= 3600:
         st.hour_window_start = now
