@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import tempfile
+import glob
+import stat
 import unittest
 from logging.handlers import RotatingFileHandler
 
@@ -53,6 +55,46 @@ class ConfigMigrationTests(unittest.TestCase):
                 payload = json.load(handle)
             self.assertEqual(payload["api_id"], 99)
 
+    def test_broken_config_is_backed_up_before_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write('{"api_id": 123, "api_hash": "secret"')
+
+            loaded = load_config(path)
+            self.assertEqual(loaded, AppConfig())
+            backups = glob.glob(path + ".broken-*")
+            self.assertEqual(len(backups), 1)
+            with open(backups[0], "r", encoding="utf-8") as handle:
+                self.assertIn('"api_hash": "secret"', handle.read())
+
+    def test_non_object_json_is_backed_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(["not", "an", "object"], handle)
+
+            self.assertEqual(load_config(path), AppConfig())
+            self.assertEqual(len(glob.glob(path + ".broken-*")), 1)
+
+    def test_string_false_is_parsed_as_false(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "api_id": 1,
+                        "api_hash": "hash",
+                        "parse_user_id": "false",
+                        "parse_username": "TRUE",
+                    },
+                    handle,
+                )
+
+            loaded = load_config(path)
+            self.assertFalse(loaded.parse_user_id)
+            self.assertTrue(loaded.parse_username)
+
 
 class LoggingTests(unittest.TestCase):
     def test_rotating_handler_is_configured(self):
@@ -75,6 +117,11 @@ class LoggingTests(unittest.TestCase):
                 handler.close()
                 logger.removeHandler(handler)
             self.assertTrue(os.path.exists(path))
+            if os.name != "nt":
+                self.assertEqual(
+                    stat.S_IMODE(os.stat(path).st_mode),
+                    0o600,
+                )
 
 
 if __name__ == "__main__":
