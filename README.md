@@ -169,7 +169,7 @@ options.txt
 options.txt.migrated
 ```
 
-На Linux конфигу назначаются права `0600`.
+На Linux конфигу назначаются права `0600`. Если `config.json` повреждён или содержит некорректный JSON-root, исходный файл сначала переносится в `config.json.broken-<timestamp>`, и только после этого создаётся конфигурация по умолчанию.
 
 ## Telegram-сессии
 
@@ -243,7 +243,7 @@ invite_ledger.db
 
 Telegram `access_hash` зависит от аккаунта/session. Поэтому v2.4 не переносит `InputPeerUser(user_id, access_hash)` между разными Telegram-аккаунтами.
 
-Каждая сессия самостоятельно резолвит пользователя и target перед действием.
+Каждая сессия самостоятельно резолвит пользователя и target перед действием. ID-кэш проверяется раньше username lookup; FloodWait из resolve-пути не скрывается и ставит конкретную session на паузу. Для ID-only пользователей сохраняется `preferred_session` — сессия, которая ранее видела этого пользователя.
 
 ## Экспорт
 
@@ -259,7 +259,7 @@ exports/
 - JSON;
 - TXT.
 
-CSV записывается как UTF-8 with BOM, чтобы его было удобно открывать в Excel.
+CSV записывается как UTF-8 with BOM, чтобы его было удобно открывать в Excel. Текстовые значения, начинающиеся с формульных префиксов Excel/LibreOffice, экранируются. На POSIX каталог `exports/` создаётся с `0700`, а файлы CSV/JSON/TXT — с `0600`.
 
 ## Invite history
 
@@ -311,7 +311,7 @@ app.log
 - WARNING;
 - ERROR.
 
-API Hash, auth-коды, 2FA-пароли и содержимое session-файлов логироваться не должны.
+API Hash, auth-коды, 2FA-пароли и содержимое session-файлов логироваться не должны. В рабочем inviter-пути идентификаторы пользователей в логах псевдонимизируются стабильным `user#...` вместо raw `user_id/@username`. На POSIX `app.log` и его новые rotated-файлы создаются с `0600`. Файл лога создаётся только при первой реальной записи, а не при импорте модуля.
 
 ## Структура проекта
 
@@ -329,7 +329,8 @@ API Hash, auth-коды, 2FA-пароли и содержимое session-фай
 ├── tests/
 │   ├── test_stage_b.py
 │   ├── test_stage_c.py
-│   └── test_stage_d.py
+│   ├── test_stage_d.py
+│   └── test_audit_regressions.py
 ├── docs/
 │   └── TZ-v2.4.md
 ├── requirements.txt
@@ -358,11 +359,13 @@ python -m py_compile \
 GitHub Actions автоматически выполняет:
 
 - установку зависимостей;
+- `pip-audit` по `requirements.txt`;
+- fatal-checks через ruff;
 - compile check;
-- unit tests;
+- unit/regression tests;
 - SQLite smoke test;
 
-на Python 3.11, 3.12 и 3.13.
+на Python 3.11, 3.12 и 3.13. Workflow запускается для `main`, `fix/v2.4-audit` и pull requests.
 
 ## Runtime-файлы
 
@@ -382,6 +385,23 @@ exports/
 ```
 
 Это уже настроено в `.gitignore`.
+
+
+## Локальные персональные данные
+
+SQLite, exports и legacy TXT могут содержать Telegram ID, usernames и имена третьих лиц. Используйте их только при наличии законного основания и удаляйте после окончания задачи в соответствии с применимыми правилами хранения данных.
+
+Для полной ручной очистки пользовательских данных при остановленном приложении можно удалить:
+
+```text
+invite_ledger.db*
+app.log*
+exports/
+usernames.txt
+userids.txt
+```
+
+`config.json` и каталог `sessoins/` в этот список не входят: они относятся к вашей конфигурации и авторизованным Telegram-сессиям.
 
 ## Ограничения Telegram
 
