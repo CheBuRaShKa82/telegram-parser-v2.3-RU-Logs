@@ -152,3 +152,41 @@ CI не может проверить реальные права аккаунт
 - полный style lint вместо fatal-only rules;
 - platform-specific ACL management на Windows;
 - окончательное удаление compatibility `inviting()` и `defunc.py` в следующем major release.
+
+
+## Второй аудит — 2026-10-03
+
+Повторная статическая проверка выявила дополнительные edge cases. Подтверждённые замечания исправлены:
+
+- FloodWait из `resolve_target_for_client`, `resolve_user_for_client`, `get_sender()` и fallback `get_entity()` больше не проглатывается;
+- user resolve сначала проверяет ID/entity cache текущей session, затем username;
+- sender ID добавляется в in-run dedup только после успешного получения пользователя;
+- `missing_invitee` стал target-terminal exclusion, учитывает rolling hour/day slot и `next_invite_at`;
+- `t.me/c/...`, `joinchat` и `t.me/+...` имеют collision-safe target keys; private `t.me/c` key совпадает с Telethon marked peer ID;
+- ручная цель в CLI сначала резолвится текущей session и только потом превращается в portable `target_ref`;
+- source/checkpoint IDs для Telegram entity используют `telethon.utils.get_peer_id`, поэтому Chat и Channel с одинаковым raw `.id` не склеиваются;
+- повреждённый `config.json` сохраняется как `.broken-<timestamp>`; JSON root проверяется на object, строковые booleans разбираются явно;
+- parser TXT/exports и rotating logs создаются с приватными POSIX permissions; CSV защищён от formula injection;
+- `_make_client` закрывает частичное подключение при ошибке; интерактивный `main.make_client` больше не завершает всё приложение через `SystemExit`;
+- сетево сломанная session исключается из текущего запуска вместо бесконечного повторного ожидания;
+- отрицательные rate limits нормализуются как disabled;
+- `source_id + source_type` фильтруются в одной строке `user_sources`, без ложного совпадения по двум разным источникам;
+- `app.log` больше не создаётся как side effect простого import;
+- рабочие inviter-логи используют псевдоним `user#...` вместо raw user ID/username.
+
+Добавлены regression tests на FloodWait в parser и inviter resolve-path, missing-invitee accounting, target/source collisions, broken config, private file modes, CSV formula safety, joint source filter и negative limits.
+
+### Что остаётся low-priority
+
+Не закрыто намеренно в этой ветке:
+
+- переименование `parser.py`, который совпадает с именем stdlib-модуля;
+- полная ликвидация compatibility `defunc.py` / старого `inviting()`;
+- единый объект конфигурации пути БД вместо compatibility aliases `DB_PATH/LEDGER_DB`;
+- полноценный dependency lock с hashes;
+- автоматический retention/purge scheduler (README теперь содержит явную ручную процедуру очистки);
+- Windows-specific ACL/шифрование session-файлов;
+- полный style lint вместо fatal-only набора ruff;
+- TXT legacy-export при Ctrl+C (канонические SQLite данные и checkpoint при этом сохраняются).
+
+Эти пункты не меняют исправления high/medium-priority логики, но подходят для следующего cleanup/release этапа.
