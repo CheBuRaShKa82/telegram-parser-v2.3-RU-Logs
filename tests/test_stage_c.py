@@ -269,6 +269,132 @@ class ParserCheckpointTests(unittest.TestCase):
             conn.close()
 
 
+class ParserFloodWaitTests(unittest.TestCase):
+    class FakeFloodWait(Exception):
+        def __init__(self, seconds=120):
+            super().__init__(f"FloodWait {seconds}")
+            self.seconds = seconds
+
+    def _user(self, uid):
+        return SimpleNamespace(
+            id=uid,
+            username=f"user{uid}",
+            first_name="Flood",
+            last_name="Test",
+            photo=None,
+            bot=False,
+            deleted=False,
+            scam=False,
+            fake=False,
+            status=None,
+        )
+
+    def test_message_sender_floodwait_stops_and_checkpoints(self):
+        class Message:
+            id = 50
+            sender_id = 500
+            sender = None
+            date = None
+
+            def get_sender(self):
+                raise ParserFloodWaitTests.FakeFloodWait(120)
+
+        client = FakeMessageClient([Message()])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "flood.db")
+            with (
+                patch.object(parser_mod, "DB_PATH", db),
+                patch.object(
+                    parser_mod,
+                    "FloodWaitError",
+                    self.FakeFloodWait,
+                ),
+            ):
+                parser_mod.parsing_from_messages(
+                    client,
+                    SimpleNamespace(id=777, title="Chat"),
+                    parse_id=False,
+                    parse_name=False,
+                    limit_messages=10,
+                    max_age_days=0,
+                    checkpoint_batch=100,
+                    resume=True,
+                )
+
+            conn = connect_db(db)
+            cp = checkpoint_get(conn, "messages:777")
+            self.assertTrue(cp.status.startswith("error:FloodWait:120"))
+            self.assertEqual(cp.cursor_int, None)
+            self.assertEqual(export_users_rows(conn), [])
+            conn.close()
+
+    def test_failed_first_resolution_does_not_lose_same_sender(self):
+        user = self._user(501)
+
+        class FirstMessage:
+            id = 50
+            sender_id = 501
+            sender = None
+            date = None
+
+            def get_sender(self):
+                raise ValueError("not cached")
+
+        second = SimpleNamespace(
+            id=40,
+            sender_id=501,
+            sender=user,
+            date=None,
+        )
+
+        class Client(FakeMessageClient):
+            def __init__(self):
+                super().__init__([FirstMessage(), second])
+                self.entity_calls = 0
+
+            def get_entity(self, value):
+                if isinstance(value, int):
+                    self.entity_calls += 1
+                    if self.entity_calls == 1:
+                        raise ValueError("temporary resolve miss")
+                return value
+
+        client = Client()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "retry-user.db")
+            with patch.object(parser_mod, "DB_PATH", db):
+                parser_mod.parsing_from_messages(
+                    client,
+                    SimpleNamespace(id=777, title="Chat"),
+                    parse_id=False,
+                    parse_name=False,
+                    limit_messages=10,
+                    max_age_days=0,
+                    checkpoint_batch=100,
+                    resume=True,
+                )
+
+            conn = connect_db(db)
+            rows = export_users_rows(conn)
+            self.assertEqual([row["user_id"] for row in rows], [501])
+            conn.close()
+
+    def test_manual_source_floodwait_is_not_hidden(self):
+        class Client:
+            def get_entity(self, value):
+                raise ParserFloodWaitTests.FakeFloodWait(60)
+
+        with patch.object(
+            parser_mod,
+            "FloodWaitError",
+            self.FakeFloodWait,
+        ):
+            with self.assertRaises(self.FakeFloodWait):
+                parser_mod._resolve_source_entity(Client(), "@source")
+
+
 class ParticipantCheckpointTests(unittest.TestCase):
     def test_partial_participant_failure_keeps_saved_users(self):
         user = SimpleNamespace(
