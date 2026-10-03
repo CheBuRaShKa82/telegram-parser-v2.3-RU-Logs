@@ -1979,7 +1979,7 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
                 except Exception:
                     pass
                 skip_cnt += 1
-                log_warn(f"❌ Невалидный пользователь: {raw}")
+                log_warn(f"❌ Невалидный пользователь: {display_user}")
 
             except ChatAdminRequiredError:
                 ledger_put(conn, target_key, user_key, user_id, username, "stop", "нет прав на инвайт")
@@ -1994,7 +1994,7 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
             except ValueError:
                 ledger_put(conn, target_key, user_key, user_id, username, "failed", "cannot_resolve_in_session")
                 fail_cnt += 1
-                log_warn(f"⏭️ Не удалось резолвить {user_key} в текущей сессии.")
+                log_warn(f"⏭️ Не удалось резолвить {display_user} в текущей сессии.")
 
             except (ConnectionResetError, ConnectionError, OSError) as e:
                 ledger_put(conn, target_key, user_key, user_id, username, "failed", f"{type(e).__name__}")
@@ -2005,12 +2005,12 @@ def inviting(client: TelegramClient, target: Union[str, int, Any], users: List[U
             except RPCError as e:
                 ledger_put(conn, target_key, user_key, user_id, username, "failed", f"{type(e).__name__}")
                 fail_cnt += 1
-                log_warn(f"⚠️ Ошибка RPC ({type(e).__name__}) для {raw}")
+                log_warn(f"⚠️ Ошибка RPC ({type(e).__name__}) для {display_user}")
 
             except Exception as e:
                 ledger_put(conn, target_key, user_key, user_id, username, "failed", f"{type(e).__name__}")
                 fail_cnt += 1
-                log_warn(f"⚠️ Неизвестная ошибка ({type(e).__name__}) для {raw}")
+                log_warn(f"⚠️ Неизвестная ошибка ({type(e).__name__}) для {display_user}")
 
         log_ok(f"🏁 Инвайт завершён. Успех: {ok_cnt}, пропуск: {skip_cnt}, ошибки: {fail_cnt}")
     finally:
